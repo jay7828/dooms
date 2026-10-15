@@ -1,0 +1,14 @@
+dooms.cpp
+Copyright 2026 the dooms.cpp authors. Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party software this project builds on (fetched at build time, not copied into this repository):
+  - llama.cpp and ggml (MIT License), https://github.com/ggml-org/llama.cpp, pinned in CMakeLists.txt.
+
+Models are not part of this repository and are not distributed with it. The converters in tools/ transform checkpoints that you obtain yourself into the engine's
+formats; each model keeps its own licence, which you must comply with:
+  - SmolVLM / SmolVLM2 (Hugging Face): Apache-2.0.
+  - SmolVLA (Hugging Face / LeRobot): Apache-2.0.
+  - Any text model you load through the LLM API (Qwen, Llama, Gemma, ...): the licence of that model.
+
+This repository deliberately excludes the hand-pose (mesh) models WiLoR and MANO and the hand detector derived from an AGPL-licensed checkpoint: their licences restrict
+redistribution and commercial use, so neither their code paths nor any converted weights are published here.
