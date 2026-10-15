@@ -13,7 +13,7 @@
   <link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css">
   <link rel="stylesheet" href="styles.css">
   <script>
-    try { var t = localStorage.getItem("theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+    try { var t = localStorage.getItem("dooms.theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
   </script>
 </head>
 <body>
@@ -28,6 +28,7 @@
         <a href="#log">Log</a>
         <a href="#use">Install</a>
         <a href="#source">Source</a>
+        <a href="#projects">Projects</a>
       </nav>
       <div class="nav-end">
         <button class="icon-btn" id="theme" type="button" aria-label="Toggle dark mode"><i class="ph ph-circle-half"></i></button>
@@ -200,6 +201,37 @@ dooms-cli vla --models models/smolvla --prompt "pick up the cube" \
           </div>
         </a>
       </div>
+    </section>
+
+    <!-- other projects: one large tile for the sibling Dooms project, four for the rest -->
+    <section class="projects wrap" id="projects">
+      <h2 class="rise-in">Other things we built</h2>
+      <div class="proj-grid">
+        <a class="proj big rise-in" href="https://dooms-inference.vercel.app" style="--s:0">
+          <div class="proj-img"><img src="projects/dooms-inference.webp" alt="Dooms Inference website: a robot arm studio running in the browser" loading="lazy" width="960" height="600"></div>
+          <div class="proj-body">
+            <h3>Dooms Inference <i class="ph ph-arrow-up-right"></i></h3>
+            <p>One sentence and one depth image become controller skills for a robot arm. Four Claude agents plan; MuJoCo runs it in your browser.</p>
+          </div>
+        </a>
+        <a class="proj rise-in" href="https://www.motionintelligence.xyz" style="--s:1">
+          <div class="proj-img"><img src="projects/motion.webp" alt="Motion Intelligence website" loading="lazy" width="960" height="600"></div>
+          <div class="proj-body"><h3>Motion Intelligence <i class="ph ph-arrow-up-right"></i></h3><p>A platform for packaging, deploying and running custom video models.</p></div>
+        </a>
+        <a class="proj rise-in" href="https://www.dbxstudio.com" style="--s:2">
+          <div class="proj-img"><img src="projects/dbx.webp" alt="DBX Studio, an AI SQL client" loading="lazy" width="960" height="512"></div>
+          <div class="proj-body"><h3>DBX Studio <i class="ph ph-arrow-up-right"></i></h3><p>Write SQL in plain English, generated and checked on your own machine.</p></div>
+        </a>
+        <a class="proj rise-in" href="https://www.junekids.xyz" style="--s:3">
+          <div class="proj-img"><img src="projects/junekids.webp" alt="June Kids website" loading="lazy" width="960" height="600"></div>
+          <div class="proj-body"><h3>June Kids <i class="ph ph-arrow-up-right"></i></h3><p>A storytelling app that writes and narrates personalised stories for children.</p></div>
+        </a>
+        <a class="proj rise-in" href="https://sumrlabs.com" style="--s:4">
+          <div class="proj-img logo-tile"><img src="projects/sumr-logo.webp" alt="SumrLabs" loading="lazy" width="1121" height="266"></div>
+          <div class="proj-body"><h3>SumrLabs <i class="ph ph-arrow-up-right"></i></h3><p>Clinical summaries and medical-code ranking for healthcare teams.</p></div>
+        </a>
+      </div>
+      <a class="all-link" href="https://jayesh-portfolio-hub.vercel.app">Everything else on the portfolio <i class="ph ph-arrow-right"></i></a>
     </section>
   </main>
 

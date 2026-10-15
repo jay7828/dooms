@@ -75,8 +75,10 @@
     else onReveal(el, go);
   }
 
+  // highlight form: the engine in the Dooms orange, every baseline in one neutral grey, each named on its own row
   function legend(el, systems) {
-    el.innerHTML = systems.map((s) => `<span><i style="background:${color(s)}"></i>${D.systems[s].label}</span>`).join("");
+    const others = systems.filter((s) => s !== "dooms").map((s) => D.systems[s].label);
+    el.innerHTML = `<span><i style="background:var(--s1)"></i>dooms.cpp</span>` + (others.length ? `<span><i style="background:var(--s2)"></i>${others.join(", ")}</span>` : "");
   }
 
   // ---------------------------------------------------------------- hero
@@ -290,9 +292,9 @@
   // ---------------------------------------------------------------- theme toggle (system by default, remembered when chosen)
   $("#theme").addEventListener("click", () => {
     const root = document.documentElement;
-    const dark = root.dataset.theme ? root.dataset.theme === "dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
-    root.dataset.theme = dark ? "light" : "dark";
-    try { localStorage.setItem("theme", root.dataset.theme); } catch (err) {}
+    const dark = root.dataset.theme ? root.dataset.theme === "dark" : !window.matchMedia("(prefers-color-scheme: light)").matches;
+    const apply = () => { root.dataset.theme = dark ? "light" : "dark"; try { localStorage.setItem("dooms.theme", root.dataset.theme); } catch (err) {} };
+    if (!reduce && document.startViewTransition) document.startViewTransition(apply); else apply();
   });
 
 
