@@ -48,7 +48,7 @@ Tokens match transformers' on the reference prompts and photos for every model a
 ## Use it
 
 ```
-pip install https://github.com/jay7828/dooms/releases/download/v0.3.0/dooms_cpp-0.3.0-py3-none-macosx_14_0_arm64.whl
+pip install dooms-cpp                         # PyPI; the import and the command are both `dooms`
 dooms pull qwen2.5-0.5b                       # downloads and verifies a GGUF (SHA-256)
 dooms serve --model ~/.cache/dooms/qwen2.5-0.5b-instruct-q4_k_m.gguf   # OpenAI-compatible API on 127.0.0.1:8080
 ```

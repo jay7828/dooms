@@ -5,8 +5,7 @@ Apple Silicon macOS only (ADR 0005). Models are never bundled: bring a GGUF for 
 ## Python
 
 ```
-pip install https://github.com/jay7828/dooms/releases/download/v0.3.0/dooms_cpp-0.3.0-py3-none-macosx_14_0_arm64.whl   # or your own build: scripts/package-python.sh; needs numpy
-                                                               # once released: pip install dooms-cpp (import name and command: dooms)
+pip install dooms-cpp      # PyPI (macOS 14+, Apple Silicon); or the wheel attached to the GitHub release, or your own build: scripts/package-python.sh
 ```
 
 ```python
