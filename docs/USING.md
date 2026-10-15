@@ -28,8 +28,8 @@ string. Each call is a fresh conversation. Errors raise `dooms.DoomsError` (`.co
 ## C++
 
 ```
-curl -LO https://github.com/jay7828/dooms/releases/download/v0.3.0/dooms-sdk-0.3.0-macos-arm64.tar.gz && tar xzf dooms-sdk-0.3.0-macos-arm64.tar.gz   # or scripts/package-sdk.sh
-cmake -S examples/cpp -B build -DCMAKE_PREFIX_PATH=$PWD/dooms-sdk-0.3.0-macos-arm64
+curl -LO https://github.com/jay7828/dooms/releases/download/v0.3.1/dooms-sdk-0.3.1-macos-arm64.tar.gz && tar xzf dooms-sdk-0.3.1-macos-arm64.tar.gz   # or scripts/package-sdk.sh
+cmake -S examples/cpp -B build -DCMAKE_PREFIX_PATH=$PWD/dooms-sdk-0.3.1-macos-arm64
 ```
 
 ```cpp
