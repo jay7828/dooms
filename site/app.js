@@ -83,13 +83,15 @@
   const engineVla = D.vla.totals[0].ms;
   barChart($("#hero-chart"), D.vla.totals.map((t) => ({ sys: t.sys, name: t.name, value: t.ms })), "ms", "lower", { ref: engineVla, immediate: true });
 
-  // ---------------------------------------------------------------- where the time goes
+  // ---------------------------------------------------------------- where the time goes: a race in real proportion
+  // Both runs start together; each row is uncovered at a constant rate, so the engine's row finishes after 266.6/603.8 of the time PyTorch takes.
   (function timeline() {
     const el = $("#timeline");
+    const e2e = { dooms: D.vla.totals[0].ms, pytorch: D.vla.totals.find((t) => t.name === "PyTorch MPS fp32").ms };
     const rows = [["dooms", "dooms.cpp", "Neural Engine"], ["pytorch", "PyTorch", "MPS, fp32"]];
     const total = (s) => D.vla.stages[s].reduce((a, b) => a + b.ms, 0);
     const max = Math.max(total("dooms"), total("pytorch"));
-    const segs = [];
+    const parts = {};
     rows.forEach(([key, name, sub]) => {
       const row = document.createElement("div");
       row.className = "tl-row";
@@ -105,25 +107,54 @@
         seg.className = "seg";
         seg.dataset.i = i;
         seg.style.flex = `${st.ms} 0 0`;
-        seg.style.transitionDelay = reduce ? "0s" : `${(key === "dooms" ? 0 : 0.25) + i * 0.18}s`;
         seg.textContent = `${fmt(st.ms)} ms`;
         const label = `${name}, ${st.stage}: ${fmt(st.ms)} ms`;
         seg.addEventListener("pointermove", (e) => showTip(label, e.clientX, e.clientY));
         seg.addEventListener("pointerleave", hideTip);
         track.append(seg);
-        segs.push(seg);
       });
-      const tot = document.createElement("div");
-      tot.className = "tl-total";
-      const e2e = key === "dooms" ? D.vla.totals[0].ms : D.vla.totals.find((t) => t.name === "PyTorch MPS fp32").ms;
-      tot.textContent = `${fmt(e2e)} ms end to end`;
-      wrap.append(track, tot);
+      const cover = document.createElement("div");
+      cover.className = "tl-cover";
+      track.append(cover);
+      const done = document.createElement("div");
+      done.className = "tl-done";
+      done.innerHTML = key === "dooms" ? `done in <b>${fmt(e2e[key])} ms</b>` : `done in ${fmt(e2e[key])} ms`;
+      wrap.append(track, done);
       row.append(lab, wrap);
       el.append(row);
+      parts[key] = { cover, done, ms: e2e[key] };
     });
     $("#stage-key").innerHTML = D.vla.stages.dooms
       .map((s, i) => `<span><i style="background:var(--stage-${i + 1})"></i>${s.stage}</span>`).join("");
-    onReveal(el, () => segs.forEach((s) => s.classList.add("in")));
+
+    const clock = $("#race-clock");
+    const longest = Math.max(e2e.dooms, e2e.pytorch);
+    const wall = 3200; // ms of animation for the slower run
+    let raf = 0;
+    function finish() {
+      for (const k in parts) { parts[k].cover.style.transform = "scaleX(0)"; parts[k].done.classList.add("in"); }
+      clock.textContent = `${fmt(longest)} ms`;
+    }
+    function run() {
+      cancelAnimationFrame(raf);
+      if (reduce) { finish(); return; }
+      for (const k in parts) { parts[k].cover.style.transform = "scaleX(1)"; parts[k].done.classList.remove("in"); }
+      const t0 = performance.now();
+      const tick = (now) => {
+        const simulated = Math.min(longest, ((now - t0) / wall) * longest);
+        clock.textContent = `${Math.round(simulated)} ms`;
+        for (const k in parts) {
+          const p = Math.min(1, simulated / parts[k].ms);
+          parts[k].cover.style.transform = `scaleX(${1 - p})`;
+          if (p >= 1) parts[k].done.classList.add("in");
+        }
+        if (simulated < longest) raf = requestAnimationFrame(tick);
+      };
+      raf = requestAnimationFrame(tick);
+    }
+    if (reduce) finish(); else for (const k in parts) parts[k].cover.style.transform = "scaleX(1)";
+    onReveal(el, run);
+    $("#replay").addEventListener("click", run);
   })();
 
   // ---------------------------------------------------------------- benchmark tabs
@@ -263,6 +294,52 @@
     root.dataset.theme = dark ? "light" : "dark";
     try { localStorage.setItem("theme", root.dataset.theme); } catch (err) {}
   });
+
+
+  // ---------------------------------------------------------------- hero number: from PyTorch's time down to the engine's
+  (function heroCount() {
+    const n = $("#hero-count");
+    const to = Math.round(D.vla.totals[0].ms), from = Math.round(D.vla.totals.find((t) => t.name === "PyTorch MPS fp32").ms);
+    if (reduce) { n.textContent = to; return; }
+    n.textContent = from;
+    const t0 = performance.now() + 450, dur = 1500;
+    const step = (now) => {
+      const k = Math.max(0, Math.min(1, (now - t0) / dur)), ease = 1 - Math.pow(1 - k, 4);
+      n.textContent = Math.round(from + (to - from) * ease);
+      if (k < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  })();
+
+  // ---------------------------------------------------------------- section headings and loss figures rise as they arrive
+  $$(".rise-in").forEach((el) => onReveal(el, () => {
+    el.classList.add("in");
+    $$("[data-count]", el).forEach((c) => {
+      if (reduce) return;
+      const to = +c.dataset.count, suffix = c.dataset.suffix || "", d = to % 1 ? 2 : 0, t0 = performance.now(), dur = 1100;
+      const step = (now) => {
+        const k = Math.min(1, (now - t0) / dur), ease = 1 - Math.pow(1 - k, 3);
+        c.textContent = (to * ease).toFixed(d) + suffix;
+        if (k < 1) requestAnimationFrame(step);
+      };
+      requestAnimationFrame(step);
+    });
+  }));
+  if (!io) $$(".rise-in").forEach((el) => el.classList.add("in"));
+
+  // ---------------------------------------------------------------- GitHub: live repository and profile details (the static text stays if the API is unreachable)
+  fetch("https://api.github.com/repos/jay7828/dooms").then((r) => (r.ok ? r.json() : null)).then((d) => {
+    if (!d) return;
+    $("#repo-stars").textContent = d.stargazers_count;
+    $("#repo-forks").textContent = d.forks_count;
+    if (d.description) $("#repo-desc").textContent = d.description;
+  }).catch(() => {});
+  fetch("https://api.github.com/users/jay7828").then((r) => (r.ok ? r.json() : null)).then((d) => {
+    if (!d) return;
+    if (d.name) $("#author-name").textContent = d.name;
+    if (d.avatar_url) $("#author-avatar").src = d.avatar_url + "&s=160";
+    $("#author-meta").textContent = `${d.public_repos} public repositories`;
+  }).catch(() => {});
 
   $("#machine").textContent = D.machine;
   $("#measured").textContent = D.measured;

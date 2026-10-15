@@ -9,6 +9,7 @@
   <meta property="og:description" content="Language, vision-language and robot-action models on Apple Silicon, measured against PyTorch, MLX and llama.cpp.">
   <link rel="preload" href="fonts/geist-400.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="preload" href="fonts/geist-600.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css">
   <link rel="stylesheet" href="styles.css">
   <script>
@@ -20,32 +21,34 @@
 
   <header class="nav">
     <div class="wrap nav-row">
-      <a class="brand" href="#top">dooms.cpp</a>
+      <a class="brand" href="#top"><svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><rect class="mark-bg" width="32" height="32" rx="9"/><path class="mark-d" d="M9 6.5h6.2a9.5 9.5 0 0 1 9.3 7.6h-6.1a3.4 3.4 0 1 0 0 3.8h6.1a9.5 9.5 0 0 1-9.3 7.6H9z"/><circle class="mark-dot" cx="15.6" cy="16" r="1.5"/></svg><span>dooms.cpp</span></a>
       <nav aria-label="Sections">
         <a href="#where">Where time goes</a>
         <a href="#bench">Benchmarks</a>
         <a href="#log">Log</a>
         <a href="#use">Install</a>
+        <a href="#source">Source</a>
       </nav>
       <div class="nav-end">
         <button class="icon-btn" id="theme" type="button" aria-label="Toggle dark mode"><i class="ph ph-circle-half"></i></button>
         <a class="icon-btn" href="https://github.com/jay7828/dooms" aria-label="Source on GitHub"><i class="ph ph-github-logo"></i></a>
       </div>
     </div>
+    <div class="progress" aria-hidden="true"></div>
   </header>
 
   <main id="main">
     <!-- hero: the claim on the left, the evidence for it on the right -->
     <section class="hero wrap" id="top">
       <div class="hero-copy">
-        <h1>Robot actions in 267&nbsp;ms on a laptop.</h1>
-        <p class="lede">An inference engine for Apple Silicon. Language, vision and action models on the GPU and the Neural Engine, measured against PyTorch, MLX and llama.cpp.</p>
-        <div class="ctas">
+        <h1 class="split"><span class="w">Robot</span> <span class="w">actions</span> <span class="w">in</span> <span class="w nowrap"><span id="hero-count">267</span>&nbsp;ms</span> <span class="w">on</span> <span class="w">a</span> <span class="w">laptop.</span></h1>
+        <p class="lede rise" style="--d:.55s">An inference engine for Apple Silicon. Language, vision and action models on the GPU and the Neural Engine, measured against PyTorch, MLX and llama.cpp.</p>
+        <div class="ctas rise" style="--d:.7s">
           <a class="btn primary" href="#bench">See the numbers</a>
           <a class="btn ghost" href="https://github.com/jay7828/dooms"><i class="ph ph-github-logo"></i> Source</a>
         </div>
       </div>
-      <figure class="hero-fig" aria-labelledby="hero-cap">
+      <figure class="hero-fig rise" style="--d:.35s" aria-labelledby="hero-cap">
         <figcaption id="hero-cap">
           <span class="fig-title">SmolVLA, three cameras to a 50-step action chunk</span>
           <span class="fig-sub">milliseconds per observation, lower is better</span>
@@ -57,8 +60,12 @@
     <!-- where the time goes: stacked stage timeline, engine vs PyTorch -->
     <section class="where" id="where">
       <div class="wrap">
-        <h2>Same model, a third of the time</h2>
+        <h2 class="rise-in">Same model, a third of the time</h2>
         <p class="section-body">Every stage of SmolVLA runs on the Neural Engine through Core ML. The vision towers are 70% of what is left, and attention inside them is the part nothing has made faster yet.</p>
+        <div class="race-bar">
+          <button class="btn ghost small" id="replay" type="button"><i class="ph ph-play"></i> Run it again</button>
+          <span class="race-clock" id="race-clock" aria-live="off">0 ms</span>
+        </div>
         <div class="timeline" id="timeline" role="img" aria-label="Stage timings: dooms.cpp 185.8, 18.9 and 58.1 ms; PyTorch MPS 327.9, 55.5 and 220.3 ms"></div>
         <div class="stage-key" id="stage-key"></div>
       </div>
@@ -67,7 +74,7 @@
     <!-- benchmarks: one chart at a time, switchable, with a table view -->
     <section class="bench wrap" id="bench">
       <div class="bench-head">
-        <h2>Benchmarks</h2>
+        <h2 class="rise-in">Benchmarks</h2>
         <p class="section-body">Median of three interleaved rounds per configuration, one process each, on an idle machine plugged in. The baselines run their fastest setting on the same machine.</p>
       </div>
       <div class="tabs" role="tablist" aria-label="Benchmark">
@@ -95,18 +102,18 @@
 
     <!-- the honest part, set as a statement -->
     <section class="losses wrap">
-      <h2>Where it loses</h2>
+      <h2 class="rise-in">Where it loses</h2>
       <div class="loss-grid">
-        <div class="loss">
-          <div class="loss-num"><span>3.41</span> vs <span>4.58</span></div>
+        <div class="loss rise-in">
+          <div class="loss-num"><span data-count="3.41">3.41</span> vs <span data-count="4.58">4.58</span></div>
           <p>ms per token, SmolVLM decode against MLX. The gap sits inside llama.cpp's Metal decode path, which runs the engine's text model.</p>
         </div>
-        <div class="loss">
-          <div class="loss-num"><span>212</span> vs <span>164</span></div>
+        <div class="loss rise-in">
+          <div class="loss-num"><span data-count="212">212</span> vs <span data-count="164">164</span></div>
           <p>tokens per second at 4-bit, MLX-LM against llama.cpp's Q4_K_M. The engine inherits llama.cpp's number.</p>
         </div>
-        <div class="loss">
-          <div class="loss-num"><span>15x</span></div>
+        <div class="loss rise-in">
+          <div class="loss-num"><span data-count="15" data-suffix="x">15x</span></div>
           <p>more error in the SmolVLA action chunk on the Neural Engine (1.2e-2) than on the GPU (7.5e-4). The speed costs precision.</p>
         </div>
       </div>
@@ -116,7 +123,7 @@
     <section class="log" id="log">
       <div class="wrap log-grid">
         <div class="log-side">
-          <h2>What moved the numbers</h2>
+          <h2 class="rise-in">What moved the numbers</h2>
           <p class="section-body">Each change was measured before and after, one at a time. One of these made things worse, and one was a measurement error.</p>
         </div>
         <ol class="log-list" id="log-list"></ol>
@@ -125,7 +132,7 @@
 
     <!-- install: three ways in -->
     <section class="use wrap" id="use">
-      <h2>Use it from Python, C++ or a terminal</h2>
+      <h2 class="rise-in">Use it from Python, C++ or a terminal</h2>
       <div class="code-tabs" role="tablist" aria-label="Language">
         <button role="tab" aria-selected="true" data-code="py">Python</button>
         <button role="tab" aria-selected="false" data-code="cpp">C++</button>
@@ -167,12 +174,39 @@ dooms-cli vla --models models/smolvla --prompt "pick up the cube" \
         <div><dt>Apache-2.0</dt><dd>The engine and bindings. Models keep their own licences and are never bundled.</dd></div>
       </dl>
     </section>
+    <!-- source: the repository and who built it, both live from the GitHub API -->
+    <section class="source wrap" id="source">
+      <h2 class="rise-in">Open source, Apache-2.0</h2>
+      <div class="source-grid">
+        <a class="repo-card" href="https://github.com/jay7828/dooms">
+          <div class="repo-top">
+            <i class="ph ph-git-branch"></i>
+            <span class="repo-name">jay7828 / <strong>dooms</strong></span>
+          </div>
+          <p class="repo-desc" id="repo-desc">Inference engine for Apple Silicon: LLMs (any GGUF), SmolVLM and SmolVLA, with C++, C and Python APIs.</p>
+          <div class="repo-stats">
+            <span><i class="ph ph-star"></i> <b id="repo-stars">1</b> stars</span>
+            <span><i class="ph ph-git-fork"></i> <b id="repo-forks">0</b> forks</span>
+            <span><i class="ph ph-scales"></i> Apache-2.0</span>
+          </div>
+          <span class="repo-cta">Open on GitHub <i class="ph ph-arrow-up-right"></i></span>
+        </a>
+        <a class="author-card" href="https://github.com/jay7828">
+          <img id="author-avatar" src="https://avatars.githubusercontent.com/u/122548702?v=4&amp;s=160" alt="GitHub avatar of jay7828" width="72" height="72" loading="lazy">
+          <div>
+            <div class="author-name" id="author-name">jay7828</div>
+            <div class="author-login">github.com/jay7828</div>
+            <div class="author-meta" id="author-meta"></div>
+          </div>
+        </a>
+      </div>
+    </section>
   </main>
 
   <footer class="foot">
     <div class="wrap foot-row">
       <span>dooms.cpp. Measured on an <span id="machine"></span>, <span id="measured"></span>.</span>
-      <span><a href="https://github.com/jay7828/dooms">GitHub</a><a href="https://github.com/jay7828/dooms/blob/main/docs/USING.md">Docs</a><a href="https://github.com/jay7828/dooms/blob/main/LICENSE">Licence</a></span>
+      <span><a href="https://github.com/jay7828">@jay7828</a><a href="https://github.com/jay7828/dooms">GitHub</a><a href="https://github.com/jay7828/dooms/blob/main/docs/USING.md">Docs</a><a href="https://github.com/jay7828/dooms/blob/main/LICENSE">Licence</a></span>
     </div>
   </footer>
 
