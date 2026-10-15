@@ -356,3 +356,11 @@ body { transition: background-color .5s cubic-bezier(.16,1,.3,1), color .5s cubi
 .tag { font-size: 12px; font-weight: 500; letter-spacing: 0; padding: 2px 9px; border-radius: 999px; background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--line); }
 div.proj { cursor: default; }
 @media (max-width: 760px) { .proj-grid.two { grid-template-columns: 1fr; } }
+
+/* three tiles: the Dooms sibling tall on the left, RYDU and Mirikids stacked on the right */
+.proj-grid.three { grid-template-columns: 1.45fr 1fr; grid-template-rows: auto auto; }
+.proj-grid.three .proj.big { grid-column: 1; grid-row: 1 / span 2; }
+.proj-grid.three .proj.big .proj-img { flex: 1; aspect-ratio: auto; min-height: 280px; }
+.proj-grid.three .proj:not(.big) .proj-img { aspect-ratio: 16 / 9; }
+@media (max-width: 860px) { .proj-grid.three { grid-template-columns: 1fr; } .proj-grid.three .proj.big { grid-row: auto; } .proj-grid.three .proj.big .proj-img { aspect-ratio: 16 / 10; flex: none; } }
+.proj-grid.three .proj.big .proj-img img { object-position: left 30%; }
