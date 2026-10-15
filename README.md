@@ -23,7 +23,7 @@ dooms::Llm llm("qwen2.5-0.5b-instruct-q4_k_m.gguf");
 std::cout << llm.chat({{"user", "Name three colours."}}, 48) << "\n";
 ```
 
-See [docs/USING.md](docs/USING.md) for installation and the full API. Models are not included.
+See [docs/USING.md](docs/USING.md) for installation and the full API, and [dooms-kappa.vercel.app](https://dooms-kappa.vercel.app) for the benchmarks and what changed along the way. Models are not included.
 
 ## Build
 ```

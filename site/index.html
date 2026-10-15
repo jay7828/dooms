@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>dooms.cpp</title>
+  <meta name="description" content="An inference engine for Apple Silicon: language, vision-language and robot-action models on the GPU and the Neural Engine, with every number measured.">
+  <meta property="og:title" content="dooms.cpp">
+  <meta property="og:description" content="Language, vision-language and robot-action models on Apple Silicon, measured against PyTorch, MLX and llama.cpp.">
+  <link rel="preload" href="fonts/geist-400.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="fonts/geist-600.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css">
+  <link rel="stylesheet" href="styles.css">
+  <script>
+    try { var t = localStorage.getItem("theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+  </script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="nav">
+    <div class="wrap nav-row">
+      <a class="brand" href="#top">dooms.cpp</a>
+      <nav aria-label="Sections">
+        <a href="#where">Where time goes</a>
+        <a href="#bench">Benchmarks</a>
+        <a href="#log">Log</a>
+        <a href="#use">Install</a>
+      </nav>
+      <div class="nav-end">
+        <button class="icon-btn" id="theme" type="button" aria-label="Toggle dark mode"><i class="ph ph-circle-half"></i></button>
+        <a class="icon-btn" href="https://github.com/jay7828/dooms" aria-label="Source on GitHub"><i class="ph ph-github-logo"></i></a>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <!-- hero: the claim on the left, the evidence for it on the right -->
+    <section class="hero wrap" id="top">
+      <div class="hero-copy">
+        <h1>Robot actions in 267&nbsp;ms on a laptop.</h1>
+        <p class="lede">An inference engine for Apple Silicon. Language, vision and action models on the GPU and the Neural Engine, measured against PyTorch, MLX and llama.cpp.</p>
+        <div class="ctas">
+          <a class="btn primary" href="#bench">See the numbers</a>
+          <a class="btn ghost" href="https://github.com/jay7828/dooms"><i class="ph ph-github-logo"></i> Source</a>
+        </div>
+      </div>
+      <figure class="hero-fig" aria-labelledby="hero-cap">
+        <figcaption id="hero-cap">
+          <span class="fig-title">SmolVLA, three cameras to a 50-step action chunk</span>
+          <span class="fig-sub">milliseconds per observation, lower is better</span>
+        </figcaption>
+        <div class="chart" id="hero-chart" data-unit="ms"></div>
+      </figure>
+    </section>
+
+    <!-- where the time goes: stacked stage timeline, engine vs PyTorch -->
+    <section class="where" id="where">
+      <div class="wrap">
+        <h2>Same model, a third of the time</h2>
+        <p class="section-body">Every stage of SmolVLA runs on the Neural Engine through Core ML. The vision towers are 70% of what is left, and attention inside them is the part nothing has made faster yet.</p>
+        <div class="timeline" id="timeline" role="img" aria-label="Stage timings: dooms.cpp 185.8, 18.9 and 58.1 ms; PyTorch MPS 327.9, 55.5 and 220.3 ms"></div>
+        <div class="stage-key" id="stage-key"></div>
+      </div>
+    </section>
+
+    <!-- benchmarks: one chart at a time, switchable, with a table view -->
+    <section class="bench wrap" id="bench">
+      <div class="bench-head">
+        <h2>Benchmarks</h2>
+        <p class="section-body">Median of three interleaved rounds per configuration, one process each, on an idle machine plugged in. The baselines run their fastest setting on the same machine.</p>
+      </div>
+      <div class="tabs" role="tablist" aria-label="Benchmark">
+        <button role="tab" aria-selected="true" data-tab="vla">SmolVLA</button>
+        <button role="tab" aria-selected="false" data-tab="vlm">SmolVLM</button>
+        <button role="tab" aria-selected="false" data-tab="llm">LLM</button>
+        <button role="tab" aria-selected="false" data-tab="vit">ViT on the GPU</button>
+      </div>
+      <div class="bench-body">
+        <div class="bench-chart">
+          <div class="panel-head">
+            <div>
+              <div class="fig-title" id="bench-title"></div>
+              <div class="fig-sub" id="bench-sub"></div>
+            </div>
+            <div class="legend" id="bench-legend"></div>
+          </div>
+          <div id="bench-charts"></div>
+          <button class="link-btn" id="table-toggle" type="button" aria-expanded="false"><i class="ph ph-table"></i> Show as table</button>
+          <div class="table-wrap" id="bench-table" hidden></div>
+        </div>
+        <aside class="bench-note" id="bench-note"></aside>
+      </div>
+    </section>
+
+    <!-- the honest part, set as a statement -->
+    <section class="losses wrap">
+      <h2>Where it loses</h2>
+      <div class="loss-grid">
+        <div class="loss">
+          <div class="loss-num"><span>3.41</span> vs <span>4.58</span></div>
+          <p>ms per token, SmolVLM decode against MLX. The gap sits inside llama.cpp's Metal decode path, which runs the engine's text model.</p>
+        </div>
+        <div class="loss">
+          <div class="loss-num"><span>212</span> vs <span>164</span></div>
+          <p>tokens per second at 4-bit, MLX-LM against llama.cpp's Q4_K_M. The engine inherits llama.cpp's number.</p>
+        </div>
+        <div class="loss">
+          <div class="loss-num"><span>15x</span></div>
+          <p>more error in the SmolVLA action chunk on the Neural Engine (1.2e-2) than on the GPU (7.5e-4). The speed costs precision.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- engineering log: sticky heading, entries scroll past it -->
+    <section class="log" id="log">
+      <div class="wrap log-grid">
+        <div class="log-side">
+          <h2>What moved the numbers</h2>
+          <p class="section-body">Each change was measured before and after, one at a time. One of these made things worse, and one was a measurement error.</p>
+        </div>
+        <ol class="log-list" id="log-list"></ol>
+      </div>
+    </section>
+
+    <!-- install: three ways in -->
+    <section class="use wrap" id="use">
+      <h2>Use it from Python, C++ or a terminal</h2>
+      <div class="code-tabs" role="tablist" aria-label="Language">
+        <button role="tab" aria-selected="true" data-code="py">Python</button>
+        <button role="tab" aria-selected="false" data-code="cpp">C++</button>
+        <button role="tab" aria-selected="false" data-code="cli">CLI</button>
+      </div>
+      <div class="code-card">
+        <button class="copy" type="button" aria-label="Copy code"><i class="ph ph-copy"></i></button>
+<pre data-code="py"><code><span class="c"># pip install dooms-0.2.0-py3-none-macosx_11_0_arm64.whl</span>
+import dooms
+
+llm = dooms.LLM("qwen2.5-0.5b-instruct-q4_k_m.gguf")
+print(llm.chat([{"role": "user", "content": "Name three colours."}], max_new_tokens=48))
+
+for piece in llm.stream("Once upon a time", 200, temperature=0.8, seed=1):
+    print(piece, end="", flush=True)
+
+vla = dooms.VLA.from_dir("models/smolvla")
+actions = vla.infer([cam1, cam2, cam3], "pick up the red cube", state)</code></pre>
+<pre data-code="cpp" hidden><code><span class="c">// find_package(dooms 0.2 REQUIRED)  target_link_libraries(app PRIVATE dooms::dooms)</span>
+#include &lt;dooms/dooms.hpp&gt;
+
+dooms::Llm llm("qwen2.5-0.5b-instruct-q4_k_m.gguf");
+std::string answer = llm.chat({{"user", "Name three colours."}}, 48);
+
+llm.generate("Once upon a time", 200, {0.8f, 40, 0.95f, 1.0f, 1}, {"\n\n"},
+             [](const std::string &amp; piece) { std::cout &lt;&lt; piece; return true; });</code></pre>
+<pre data-code="cli" hidden><code>dooms-cli llm --model qwen2.5-0.5b-instruct-q4_k_m.gguf \
+              --prompt "Name three colours." --max-tokens 64 --stats
+
+dooms-cli vlm --image photo.jpg --prompt "Describe this image." --models models/smolvlm
+
+dooms-cli vla --models models/smolvla --prompt "pick up the cube" \
+              --camera a.jpg --camera b.jpg --camera c.jpg --state 0,0,0,0,0,0</code></pre>
+      </div>
+      <dl class="facts">
+        <div><dt>Any GGUF</dt><dd>Every architecture and quantization llama.cpp loads, with chat templates, streaming, stop strings and seeded sampling.</dd></div>
+        <div><dt>Self-contained</dt><dd>The wheel and the SDK carry their own libraries. No build tree, no Xcode project.</dd></div>
+        <div><dt>Apple Silicon only</dt><dd>Metal on the GPU, Core ML for the Neural Engine, Accelerate on the CPU.</dd></div>
+        <div><dt>Apache-2.0</dt><dd>The engine and bindings. Models keep their own licences and are never bundled.</dd></div>
+      </dl>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <div class="wrap foot-row">
+      <span>dooms.cpp. Measured on an <span id="machine"></span>, <span id="measured"></span>.</span>
+      <span><a href="https://github.com/jay7828/dooms">GitHub</a><a href="https://github.com/jay7828/dooms/blob/main/docs/USING.md">Docs</a><a href="https://github.com/jay7828/dooms/blob/main/LICENSE">Licence</a></span>
+    </div>
+  </footer>
+
+  <div class="tip" id="tip" role="tooltip" hidden></div>
+  <script src="data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
