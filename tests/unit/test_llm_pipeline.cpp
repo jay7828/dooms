@@ -155,7 +155,47 @@ TEST(chat_matches_the_reference_answer) {
                 tm.prefill_ms, static_cast<long long>(tm.prompt_tokens), tm.first_token_ms, tm.decode_ms_per_token());
     EXPECT(agree >= 8);
     EXPECT(tm.generated_tokens == static_cast<int64_t>(g.value().tokens.size()));
+    // chat_tokens is exactly the prompt chat() fed the model
+    auto ct = m.chat_tokens({{"system", system}, {"user", user}});
+    EXPECT(ct.is_ok() && static_cast<int64_t>(ct.value().size()) == tm.prompt_tokens);
+    EXPECT(!m.chat_tokens({}).is_ok());
     EXPECT(!m.chat({}, o).is_ok());
+}
+
+// The own Metal decoder (the default for f16 llama/qwen2 files) against llama.cpp on the same file: identical greedy answers, sampling through llama.cpp's
+// sampler on the Metal logits (seeded: reproducible), and the engine choice reported.
+TEST(metal_and_llama_cpp_engines_agree) {
+    const std::string file = env("DOOMS_LLM_FILE");
+    if (file.empty()) { std::printf("        (skipped: set DOOMS_LLM_FILE)\n"); return; }
+    LlmOptions lo;
+    lo.text_engine = "llama.cpp";
+    auto metal = Llm::load(file);
+    auto ref = Llm::load(file, lo);
+    EXPECT(metal.is_ok() && ref.is_ok());
+    if (!metal.is_ok() || !ref.is_ok()) return;
+    EXPECT_EQ(std::string(ref.value().text_engine_used()), std::string("llama.cpp"));
+    std::printf("        default engine for this file: %s\n", metal.value().text_engine_used());
+    LlmGenerateOptions o;
+    o.max_new_tokens = 48;
+    for (const char * q : {"Name three colours.", "What is 12 times 7?"}) {
+        auto a = metal.value().chat({{"user", q}}, o);
+        auto b = ref.value().chat({{"user", q}}, o);
+        EXPECT(a.is_ok() && b.is_ok());
+        if (!a.is_ok() || !b.is_ok()) continue;
+        std::printf("        \"%s\" -> \"%s\" (%s)\n", q, a.value().text.c_str(), a.value().text == b.value().text ? "same as llama.cpp" : "DIFFERENT from llama.cpp");
+        EXPECT_EQ(a.value().text, b.value().text);
+    }
+    LlmGenerateOptions so;
+    so.max_new_tokens = 24;
+    so.sampler.temperature = 0.8f;
+    so.sampler.seed = 11;
+    auto s1 = metal.value().chat({{"user", "Tell me a fact."}}, so);
+    auto s2 = metal.value().chat({{"user", "Tell me a fact."}}, so);
+    EXPECT(s1.is_ok() && s2.is_ok());
+    if (s1.is_ok() && s2.is_ok()) EXPECT(s1.value().tokens == s2.value().tokens);
+    LlmOptions bad;
+    bad.text_engine = "gpu";
+    EXPECT(Llm::load(file, bad).status().code() == Code::InvalidArgument);
 }
 
 int main() { return dooms_test::run_all(); }

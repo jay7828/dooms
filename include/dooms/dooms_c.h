@@ -113,6 +113,29 @@ DOOMS_API dooms_code dooms_llm_chat(dooms_llm * llm, const dooms_chat_message * 
 DOOMS_API dooms_code dooms_llm_chat_stream(dooms_llm * llm, const dooms_chat_message * messages, int32_t n_messages, int32_t max_new_tokens, const dooms_llm_sampling * sampling,
                                            const char * const * stop, int32_t n_stop, dooms_text_callback callback, void * user);
 
+/* How the last generate/chat call on a handle ended, with its exact token counts (for usage accounting and to tell a token limit from a natural stop). */
+typedef enum dooms_finish_reason {
+    DOOMS_FINISH_NONE = 0,      /* no call has finished on this handle, or the last one failed */
+    DOOMS_FINISH_STOP = 1,      /* the model emitted an end-of-generation token, or a stop string matched */
+    DOOMS_FINISH_LENGTH = 2,    /* max_new_tokens tokens were generated without a stop */
+    DOOMS_FINISH_CANCELLED = 3  /* the streaming callback returned non-zero */
+} dooms_finish_reason;
+
+typedef struct dooms_llm_generation_info {
+    size_t struct_size;
+    int32_t prompt_tokens;      /* tokens fed to the model: the prompt as tokenized (BOS included) or the chat template's output */
+    int32_t completion_tokens;  /* tokens the model sampled, including a final end-of-generation token and the tokens of a matched stop string */
+    int32_t finish_reason;      /* a dooms_finish_reason */
+} dooms_llm_generation_info;
+
+/* Fills `out` (struct_size set by the caller) for the last dooms_llm_generate / _stream / dooms_llm_chat / _stream call on this handle. */
+DOOMS_API dooms_code dooms_llm_last_generation(const dooms_llm * llm, dooms_llm_generation_info * out);
+/* Number of tokens `text` becomes (add_special non-zero: with the BOS token the model asks for, as dooms_llm_generate tokenizes a prompt). An empty or NULL text is
+ * DOOMS_INVALID_ARGUMENT, like an empty prompt. */
+DOOMS_API dooms_code dooms_llm_count_tokens(dooms_llm * llm, const char * text, int32_t add_special, int32_t * count);
+/* Number of prompt tokens dooms_llm_chat would feed the model for this conversation (chat template applied, generation prompt appended; DOOMS_UNSUPPORTED without one). */
+DOOMS_API dooms_code dooms_llm_count_chat_tokens(dooms_llm * llm, const dooms_chat_message * messages, int32_t n_messages, int32_t * count);
+
 /* ---------------------------------------------------------------- vision-language-action model (SmolVLA) */
 typedef struct dooms_vla dooms_vla;
 
@@ -147,6 +170,73 @@ DOOMS_API dooms_code dooms_vla_info_get(const dooms_vla * vla, dooms_vla_info * 
  * `capacity` is in floats. The robot's own action columns come first; denormalize with your dataset's statistics. */
 DOOMS_API dooms_code dooms_vla_infer(dooms_vla * vla, const dooms_image * cameras, int32_t n_cameras, const char * task, const float * state, int32_t n_state, const float * noise,
                                      float * actions, size_t capacity);
+
+/* ---------------------------------------------------------------- asynchronous action chunks for a control loop (SmolVLA)
+ * A runner computes the next action chunk on its own thread while the robot executes the current one, and splices it in without a gap
+ * (lerobot's async inference, in-process). Polling only: no callback ever runs on the runner's thread. Per control step:
+ *     if (dooms_vla_runner_wants_observation(r)) { capture cameras + state; dooms_vla_runner_submit(r, ..., now, &started); }
+ *     dooms_vla_runner_next_action(r, now, action, capacity, &info);   if (info.available) send `action` to the robot, else hold
+ * Every action has a control step index. Row i of a chunk computed from an observation taken at step s is the action for step s + i; when
+ * the chunk arrives, rows whose step has already run are dropped, rows overlapping the queued plan are blended
+ * ((1 - new_weight) * queued + new_weight * new) and the rest are appended. Times are seconds on any monotonic clock, passed by the caller.
+ *
+ * While a runner is open on a dooms_vla, dooms_vla_infer on that handle fails (the model runs on the runner's thread) and no second runner
+ * can be opened on it. The runner keeps the model alive: dooms_vla_close may come before dooms_vla_runner_close. A runner handle, like
+ * every handle, is used from one thread at a time; closing it waits for an inference in flight to finish (it cannot be interrupted). */
+typedef struct dooms_vla_runner dooms_vla_runner;
+
+typedef struct dooms_vla_runner_options {
+    size_t struct_size;
+    double control_hz;           /* control steps per second, (0, 10000]; default 30 (lerobot) */
+    double chunk_size_threshold; /* ask for the next observation when queued / chunk_size <= this, [0, 1]; default 0.5 (lerobot). 0: synchronous */
+    double new_weight;           /* weight of the new chunk where it overlaps the queued one, [0, 1]; default 0.7 (lerobot "weighted_average"); 1 replaces */
+} dooms_vla_runner_options;
+
+typedef struct dooms_vla_action_info {
+    size_t struct_size;
+    int32_t available; /* 1: `action` was written; 0: no action this step (before the first chunk, or the queue ran dry): hold the last command */
+    int32_t skipped;   /* queued actions dropped in this call because the loop was late by whole periods */
+    int64_t step;      /* control step index of the action, -1 when none */
+} dooms_vla_action_info;
+
+typedef struct dooms_vla_runner_stats {
+    size_t struct_size;
+    int64_t actions_returned;
+    int64_t waiting_calls;      /* next_action calls without an action before the first one */
+    int64_t stalled_calls;      /* ... after it (the loop ran out of actions) */
+    int64_t late_skipped;       /* sum of dooms_vla_action_info.skipped */
+    int64_t stale_dropped;      /* rows of arrived chunks whose step had already run */
+    int64_t blended;            /* rows aggregated with a queued action */
+    int64_t chunks_received;
+    int64_t chunks_stale;       /* chunks of which every row had already passed */
+    int64_t inferences_started;
+    int64_t inferences_failed;
+    int64_t queued;             /* actions waiting now */
+    int32_t in_flight;          /* 1 while an inference runs */
+    int32_t last_error_code;    /* dooms_code of the last failed inference, DOOMS_OK if none failed */
+    double last_inference_ms;   /* wall time of the last completed inference */
+    const char * last_error;    /* its message ("" if none); valid until the next call on the runner */
+} dooms_vla_runner_stats;
+
+/* Fills *options with the defaults above (and struct_size). */
+DOOMS_API dooms_code dooms_vla_runner_options_init(dooms_vla_runner_options * options);
+/* lerobot's aggregate function names -> new_weight: "weighted_average" 0.7, "latest_only" 1, "average" 0.5, "conservative" 0.3. DOOMS_INVALID_ARGUMENT otherwise. */
+DOOMS_API dooms_code dooms_vla_aggregate_weight(const char * name, double * new_weight);
+/* options NULL: the defaults. */
+DOOMS_API dooms_code dooms_vla_runner_open(dooms_vla * vla, const dooms_vla_runner_options * options, dooms_vla_runner ** out);
+DOOMS_API void dooms_vla_runner_close(dooms_vla_runner * runner);
+/* *wants = 1 when a submitted observation would start an inference (none in flight, queue at or below the threshold; always before the first chunk). */
+DOOMS_API dooms_code dooms_vla_runner_wants_observation(dooms_vla_runner * runner, int32_t * wants);
+/* The observation taken at `timestamp_s`, arguments as dooms_vla_infer. *started (optional) = 1 if an inference started, 0 if the observation was not
+ * needed (it is dropped, never queued). The images are converted only when it is needed. */
+DOOMS_API dooms_code dooms_vla_runner_submit(dooms_vla_runner * runner, const dooms_image * cameras, int32_t n_cameras, const char * task, const float * state,
+                                             int32_t n_state, double timestamp_s, int32_t * started);
+/* The action for the control step at `now_s` (non-decreasing across calls); never waits for an inference. `action` holds action_dim floats (capacity in
+ * floats); it is written only when info->available. */
+DOOMS_API dooms_code dooms_vla_runner_next_action(dooms_vla_runner * runner, double now_s, float * action, size_t capacity, dooms_vla_action_info * info);
+/* Waits up to timeout_s for the inference in flight (start-up: wait for the first chunk); *idle (optional) = 1 if none is in flight. */
+DOOMS_API dooms_code dooms_vla_runner_wait_idle(dooms_vla_runner * runner, double timeout_s, int32_t * idle);
+DOOMS_API dooms_code dooms_vla_runner_stats_get(dooms_vla_runner * runner, dooms_vla_runner_stats * out);
 
 #ifdef __cplusplus
 }

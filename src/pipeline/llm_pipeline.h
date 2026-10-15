@@ -1,6 +1,7 @@
 #pragma once
-// A text language model from a GGUF file (any architecture llama.cpp loads, any quantization), run on the Metal GPU through llama.cpp: tokenization, the model's own
-// chat template, seeded sampling, streaming and stop strings. This is the engine's general LLM entry point; the vision-language models use the same decoder.
+// A text language model from a GGUF file: tokenization, the model's own chat template, seeded sampling, streaming and stop strings. The engine's own Metal
+// decoder (backend/metal/metal_llama_decoder.h) runs llama/qwen2 files with f16 weights; everything else (other architectures, quantized files) runs on
+// llama.cpp. llama.cpp always provides the vocabulary and the sampler (so sampling behaves the same on both). This is the engine's general LLM entry point.
 
 #include <cstdint>
 #include <functional>
@@ -15,6 +16,9 @@ namespace dooms {
 
 struct LlmOptions {
     TextDecoderOptions text;  // n_ctx (prompt + answer), n_batch, n_gpu_layers, n_threads
+    // "auto": the own Metal decoder when it can run the file, otherwise llama.cpp; "metal": the own decoder or an error; "llama.cpp".
+    std::string text_engine = "auto";
+    int32_t metal_queue_depth = 1;   // decode steps the Metal decoder keeps queued (greedy generation)
     LlmOptions() { text.n_ctx = 4096; }
 };
 
@@ -50,10 +54,13 @@ public:
     ~Llm();
 
     int64_t vocab_size() const;
+    const char * text_engine_used() const;   // "metal" or "llama.cpp"
     int32_t context_size() const;
     bool has_chat_template() const;
 
     Result<std::vector<int32_t>> tokenize(const std::string & text, bool add_special = true, bool parse_special = false) const;
+    // The exact prompt tokens chat() feeds the model for `messages` (chat template applied, generation prompt appended). Unsupported when the file has no template.
+    Result<std::vector<int32_t>> chat_tokens(const std::vector<ChatMessage> & messages) const;
 
     // Continues `prompt` (raw text; the vocabulary's BOS is added when the model asks for it). `on_text` (optional) receives each new piece of text, always complete
     // UTF-8 (a character split over tokens is held back until it is whole); return false to stop.

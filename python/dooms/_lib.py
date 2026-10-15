@@ -2,7 +2,7 @@
 import ctypes
 import os
 import sys
-from ctypes import POINTER, c_char_p, c_float, c_int32, c_size_t, c_uint8, c_uint32, c_uint64, c_void_p
+from ctypes import POINTER, c_char_p, c_double, c_float, c_int32, c_int64, c_size_t, c_uint8, c_uint32, c_uint64, c_void_p
 
 C_API_VERSION = 1
 
@@ -38,12 +38,35 @@ class ChatMessage(ctypes.Structure):
     _fields_ = [("role", c_char_p), ("content", c_char_p)]
 
 
+class LlmGenerationInfo(ctypes.Structure):
+    _fields_ = [("struct_size", c_size_t), ("prompt_tokens", c_int32), ("completion_tokens", c_int32), ("finish_reason", c_int32)]
+
+
+# dooms_finish_reason values -> names (DOOMS_FINISH_NONE ... DOOMS_FINISH_CANCELLED)
+FINISH_REASONS = {0: "none", 1: "stop", 2: "length", 3: "cancelled"}
+
+
 class VlaPaths(ctypes.Structure):
     _fields_ = [("struct_size", c_size_t), ("vision", c_char_p), ("prefix", c_char_p), ("expert", c_char_p), ("host", c_char_p), ("vocab", c_char_p)]
 
 
 class VlaOptions(ctypes.Structure):
     _fields_ = [("struct_size", c_size_t), ("units", c_char_p), ("seed", c_uint64)]
+
+
+class VlaRunnerOptions(ctypes.Structure):
+    _fields_ = [("struct_size", c_size_t), ("control_hz", c_double), ("chunk_size_threshold", c_double), ("new_weight", c_double)]
+
+
+class VlaActionInfo(ctypes.Structure):
+    _fields_ = [("struct_size", c_size_t), ("available", c_int32), ("skipped", c_int32), ("step", c_int64)]
+
+
+class VlaRunnerStats(ctypes.Structure):
+    _fields_ = [("struct_size", c_size_t), ("actions_returned", c_int64), ("waiting_calls", c_int64), ("stalled_calls", c_int64), ("late_skipped", c_int64),
+                ("stale_dropped", c_int64), ("blended", c_int64), ("chunks_received", c_int64), ("chunks_stale", c_int64), ("inferences_started", c_int64),
+                ("inferences_failed", c_int64), ("queued", c_int64), ("in_flight", c_int32), ("last_error_code", c_int32), ("last_inference_ms", c_double),
+                ("last_error", c_char_p)]
 
 
 class VlaInfo(ctypes.Structure):
@@ -106,6 +129,14 @@ def _declare(lib):
     lib.dooms_llm_chat.argtypes = [c_void_p, POINTER(ChatMessage), c_int32, c_int32, POINTER(LlmSampling), POINTER(c_char_p), c_int32, ctypes.c_char_p, c_size_t, POINTER(c_size_t)]
     lib.dooms_llm_chat_stream.restype = code
     lib.dooms_llm_chat_stream.argtypes = [c_void_p, POINTER(ChatMessage), c_int32, c_int32, POINTER(LlmSampling), POINTER(c_char_p), c_int32, TextCallback, c_void_p]
+    # appended to C API version 1 after its first release: a library built before then lacks them, and only the calls that need them fail (LLM._require)
+    if hasattr(lib, "dooms_llm_last_generation"):
+        lib.dooms_llm_last_generation.restype = code
+        lib.dooms_llm_last_generation.argtypes = [c_void_p, POINTER(LlmGenerationInfo)]
+        lib.dooms_llm_count_tokens.restype = code
+        lib.dooms_llm_count_tokens.argtypes = [c_void_p, c_char_p, c_int32, POINTER(c_int32)]
+        lib.dooms_llm_count_chat_tokens.restype = code
+        lib.dooms_llm_count_chat_tokens.argtypes = [c_void_p, POINTER(ChatMessage), c_int32, POINTER(c_int32)]
     lib.dooms_vlm_generate.restype = code
     lib.dooms_vlm_generate.argtypes = [c_void_p, POINTER(Image), c_char_p, c_int32, ctypes.c_char_p, c_size_t, POINTER(c_size_t)]
     lib.dooms_vla_open.restype = code
@@ -115,3 +146,21 @@ def _declare(lib):
     lib.dooms_vla_info_get.argtypes = [c_void_p, POINTER(VlaInfo)]
     lib.dooms_vla_infer.restype = code
     lib.dooms_vla_infer.argtypes = [c_void_p, POINTER(Image), c_int32, c_char_p, POINTER(c_float), c_int32, POINTER(c_float), POINTER(c_float), c_size_t]
+    # asynchronous chunks: every call returns promptly except wait_idle; ctypes releases the GIL during each call and the runner's thread never calls into Python
+    lib.dooms_vla_aggregate_weight.restype = code
+    lib.dooms_vla_aggregate_weight.argtypes = [c_char_p, POINTER(c_double)]
+    lib.dooms_vla_runner_options_init.restype = code
+    lib.dooms_vla_runner_options_init.argtypes = [POINTER(VlaRunnerOptions)]
+    lib.dooms_vla_runner_open.restype = code
+    lib.dooms_vla_runner_open.argtypes = [c_void_p, POINTER(VlaRunnerOptions), POINTER(c_void_p)]
+    lib.dooms_vla_runner_close.argtypes = [c_void_p]
+    lib.dooms_vla_runner_wants_observation.restype = code
+    lib.dooms_vla_runner_wants_observation.argtypes = [c_void_p, POINTER(c_int32)]
+    lib.dooms_vla_runner_submit.restype = code
+    lib.dooms_vla_runner_submit.argtypes = [c_void_p, POINTER(Image), c_int32, c_char_p, POINTER(c_float), c_int32, c_double, POINTER(c_int32)]
+    lib.dooms_vla_runner_next_action.restype = code
+    lib.dooms_vla_runner_next_action.argtypes = [c_void_p, c_double, POINTER(c_float), c_size_t, POINTER(VlaActionInfo)]
+    lib.dooms_vla_runner_wait_idle.restype = code
+    lib.dooms_vla_runner_wait_idle.argtypes = [c_void_p, c_double, POINTER(c_int32)]
+    lib.dooms_vla_runner_stats_get.restype = code
+    lib.dooms_vla_runner_stats_get.argtypes = [c_void_p, POINTER(VlaRunnerStats)]

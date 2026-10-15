@@ -1,9 +1,10 @@
 // Throughput of a text language model on the engine, measured like llama-bench: the prompt is processed in one batch (prefill, tokens/s) and then N tokens are
 // generated one by one with greedy sampling that ignores end-of-generation, so the decode count is fixed (ms/token and tokens/s).
 //
-//   bench_llm --model FILE.gguf --prompt-ids FILE [--gen N] [--ctx N] [--warmup N] [--iters N] [--threads N]
+//   bench_llm --model FILE.gguf --prompt-ids FILE [--gen N] [--ctx N] [--warmup N] [--iters N] [--threads N] [--device-sampling 0|1] [--engine auto|metal|llama.cpp]
 // --prompt-ids: whitespace-separated token ids (the same file feeds the PyTorch and MLX baselines, tools: bench/python/llm_baselines.py).
-// Reports p50 / p99 over --iters complete (prefill + decode) runs. Exit codes: 0 ok, 1 failed, 2 usage error.
+// --engine: the text engine as Llm picks it (auto: the own Metal decoder when it runs the file, else llama.cpp). Reports p50 / p99 over --iters complete
+// (prefill + decode) runs. Exit codes: 0 ok, 1 failed, 2 usage error.
 #include <chrono>
 #include <cstdio>
 #include <algorithm>
@@ -14,6 +15,7 @@
 
 #include "core/stats.h"
 #include "models/vlm/text_decoder.h"
+#include "pipeline/native_llama.h"
 
 using namespace dooms;
 
@@ -22,8 +24,8 @@ namespace {
 constexpr int kExitOk = 0, kExitFailed = 1, kExitUsage = 2;
 
 struct Options {
-    std::string model, prompt_ids;
-    int gen = 128, ctx = 0, warmup = 2, iters = 8, threads = 0;
+    std::string model, prompt_ids, engine = "auto";
+    int gen = 128, ctx = 0, warmup = 2, iters = 8, threads = 0, device_sampling = 0;
 };
 
 Result<Options> parse_args(int argc, char ** argv) {
@@ -38,8 +40,13 @@ Result<Options> parse_args(int argc, char ** argv) {
             return static_cast<int>(v);
         };
         if (flag == "--model") o.model = value;
+        else if (flag == "--engine") o.engine = value;
         else if (flag == "--prompt-ids") o.prompt_ids = value;
-        else if (flag == "--gen" || flag == "--ctx" || flag == "--warmup" || flag == "--iters" || flag == "--threads") {
+        else if (flag == "--device-sampling") {
+            auto v = num(0, 1);
+            if (!v.is_ok()) return v.status();
+            o.device_sampling = v.value();
+        } else if (flag == "--gen" || flag == "--ctx" || flag == "--warmup" || flag == "--iters" || flag == "--threads") {
             auto v = num(flag == "--warmup" || flag == "--threads" || flag == "--ctx" ? 0 : 1, 1 << 20);
             if (!v.is_ok()) return v.status();
             (flag == "--gen" ? o.gen : flag == "--ctx" ? o.ctx : flag == "--warmup" ? o.warmup : flag == "--iters" ? o.iters : o.threads) = v.value();
@@ -49,6 +56,7 @@ Result<Options> parse_args(int argc, char ** argv) {
     }
     if ((argc - 1) % 2 != 0) return invalid_argument("every option needs a value");
     if (o.model.empty() || o.prompt_ids.empty()) return invalid_argument("--model and --prompt-ids are required");
+    if (o.engine != "auto" && o.engine != "metal" && o.engine != "llama.cpp") return invalid_argument("--engine must be auto, metal or llama.cpp");
     return o;
 }
 
@@ -59,7 +67,7 @@ double ms_since(std::chrono::steady_clock::time_point t) { return std::chrono::d
 int main(int argc, char ** argv) {
     auto args = parse_args(argc, argv);
     if (!args.is_ok()) {
-        std::fprintf(stderr, "error: %s\nusage: bench_llm --model FILE.gguf --prompt-ids FILE [--gen N] [--ctx N] [--warmup N] [--iters N] [--threads N]\n", args.status().to_string().c_str());
+        std::fprintf(stderr, "error: %s\nusage: bench_llm --model FILE.gguf --prompt-ids FILE [--gen N] [--ctx N] [--warmup N] [--iters N] [--threads N] [--device-sampling 0|1] [--engine auto|metal|llama.cpp]\n", args.status().to_string().c_str());
         return kExitUsage;
     }
     const Options & o = args.value();
@@ -76,6 +84,42 @@ int main(int argc, char ** argv) {
     to.n_batch = static_cast<int32_t>(std::min<size_t>(prompt.size(), 2048));
     if (to.n_batch > to.n_ctx) to.n_batch = to.n_ctx;
     to.n_threads = o.threads;
+    to.device_sampling = o.device_sampling == 1;
+    if (o.engine != "llama.cpp") {
+        NativeLlamaOptions no;
+        no.n_ctx = to.n_ctx;
+        no.n_batch = to.n_batch;
+        auto native = load_native_llama(o.model, no);
+        if (!native.is_ok() && (o.engine == "metal" || native.status().code() != Code::Unsupported)) {
+            std::fprintf(stderr, "error: %s\n", native.status().to_string().c_str());
+            return kExitFailed;
+        }
+        if (native.is_ok()) {
+            // Same protocol on the own Metal decoder: the prompt in one call up to the first token, then a fixed number of greedy tokens.
+            MetalLlamaDecoder & d = *native.value();
+            std::vector<double> prefill_ms, decode_ms;
+            for (int it = 0; it < o.warmup + o.iters; it++) {
+                d.reset();
+                auto t0 = std::chrono::steady_clock::now();
+                if (Status st = d.eval_tokens(prompt); !st.is_ok()) { std::fprintf(stderr, "error: %s\n", st.to_string().c_str()); return kExitFailed; }
+                double pre = 0;
+                auto t1 = t0;
+                int n = 0;
+                Status st = d.generate(o.gen + 1, 1, [&](int32_t) {  // end-of-generation is ignored on purpose: the decode length is fixed
+                    if (n++ == 0) { pre = ms_since(t0); t1 = std::chrono::steady_clock::now(); }
+                    return true;
+                });
+                if (!st.is_ok()) { std::fprintf(stderr, "error: %s\n", st.to_string().c_str()); return kExitFailed; }
+                const double dec_ms = ms_since(t1);
+                if (it >= o.warmup) { prefill_ms.push_back(pre); decode_ms.push_back(dec_ms / o.gen); }
+            }
+            const double p50 = median(prefill_ms), p99 = quantile(prefill_ms, 0.99), g50 = median(decode_ms), g99 = quantile(decode_ms, 0.99);
+            std::printf("LLM %s (own Metal decoder): prompt %zu tokens, %d generated, %d warmup + %d timed runs\n", o.model.c_str(), prompt.size(), o.gen, o.warmup, o.iters);
+            std::printf("prefill  p50 %9.2f ms  p99 %9.2f ms   %8.1f tokens/s\n", p50, p99, 1000.0 * static_cast<double>(prompt.size()) / p50);
+            std::printf("decode   p50 %9.3f ms/token  p99 %9.3f   %8.1f tokens/s\n", g50, g99, 1000.0 / g50);
+            return kExitOk;
+        }
+    }
     auto dec = TextDecoder::load(o.model, to);
     if (!dec.is_ok()) { std::fprintf(stderr, "error: %s\n", dec.status().to_string().c_str()); return kExitFailed; }
     TextDecoder & d = dec.value();

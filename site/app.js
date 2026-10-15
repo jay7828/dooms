@@ -176,19 +176,20 @@
         { title: "time to first token, ms, lower is better", rows: D.vlm.ttft.map((t) => ({ sys: t.sys, name: t.name, value: t.ms })), unit: "ms", better: "lower" },
         { title: "decode, ms per token, lower is better", rows: D.vlm.decode.map((t) => ({ sys: t.sys, name: t.name, value: t.ms })), unit: "ms", better: "lower" },
       ],
-      note: `<p><strong>Faster to the first token</strong> than MLX and 1.5x faster than PyTorch. The engine's figure includes image preprocessing; the others start from prepared tensors.</p>
-             <p><strong>Slower per token than MLX.</strong> Decoding runs in llama.cpp's Metal backend. Tokens are identical to transformers.</p>`,
+      note: `<p><strong>Fastest decode: 1.27x MLX, 1.5x llama.cpp, 10x PyTorch</strong>, on the engine's own Metal decoder. First token 15 ms ahead of MLX; the engine's figure includes image preprocessing, the others start from prepared tensors.</p>
+             <p>Tokens are identical to transformers on every reference photo.</p>`,
     },
     llm: {
       title: "Qwen2.5-0.5B-Instruct",
       sub: "512-token prompt, then 128 greedy tokens",
       charts: [
-        { title: "decode, tokens per second, higher is better", rows: D.llm.decode.map((t) => ({ sys: t.sys, name: t.name, value: t.tps })), unit: "tok/s", better: "higher" },
-        { title: "prefill, tokens per second, higher is better", rows: D.llm.prefill.map((t) => ({ sys: t.sys, name: t.name, value: t.tps })), unit: "tok/s", better: "higher" },
+        { title: "decode, f16, tokens per second, higher is better", rows: D.llm.decode.map((t) => ({ sys: t.sys, name: t.name, value: t.tps })), unit: "tok/s", better: "higher" },
+        { title: "prefill, f16, tokens per second, higher is better", rows: D.llm.prefill.map((t) => ({ sys: t.sys, name: t.name, value: t.tps })), unit: "tok/s", better: "higher" },
+        { title: "decode at 4-bit (a different precision), tokens per second", rows: D.llm.decode4.map((t) => ({ sys: t.sys, name: t.name, value: t.tps })), unit: "tok/s", better: "higher" },
       ],
       note: () => `${D.llm.provisional ? '<span class="badge">single run, final interleaved run pending</span>' : ""}
-             <p><strong>Level with llama.cpp</strong>, because the text path is llama.cpp's Metal backend behind the engine's API. What the engine adds is the API, the bindings and the packaging.</p>
-             <p>Answers match transformers token for token, 29 of 29 in f16 and f32.</p>`,
+             <p><strong>Fastest f16 decode</strong>: the engine's own Metal decoder runs Qwen2 and llama files. The prompt is 13% behind llama.cpp, ahead of MLX and PyTorch.</p>
+             <p>Quantized files still run on llama.cpp inside the engine. Answers match transformers token for token, 29 of 29.</p>`,
     },
     vit: {
       title: "A 631M-parameter ViT",

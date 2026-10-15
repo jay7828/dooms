@@ -53,7 +53,11 @@ def configs():
     cs = []
     for tag, gguf in (("f16", "qwen2.5-0.5b-instruct-f16.gguf"), ("Q4_K_M", "qwen2.5-0.5b-instruct-q4_k_m.gguf")):
         path = os.path.join(M, gguf)
+        # "dooms.cpp" is the shipped choice (--engine auto: the own Metal decoder for f16, llama.cpp for quantized files); the second row forces llama.cpp.
         cs.append((f"dooms.cpp {tag}", [[os.path.join(B, "bench_llm"), "--model", path, "--prompt-ids", IDS, "--gen", "128", "--iters", "5", "--warmup", "2"]], parse_engine))
+        if tag == "f16":
+            cs.append((f"dooms.cpp {tag}, llama.cpp inside", [[os.path.join(B, "bench_llm"), "--model", path, "--prompt-ids", IDS, "--gen", "128", "--iters", "5", "--warmup", "2",
+                                                               "--engine", "llama.cpp"]], parse_engine))
         cs.append((f"llama.cpp (llama-bench) {tag}", [[LB, "-m", path, "-p", "512", "-n", "0", "-fa", "1", "-r", "3", "-o", "json"],
                                                       [LB, "-m", path, "-p", "0", "-n", "128", "-d", "512", "-fa", "1", "-r", "3", "-o", "json"]], parse_llama_bench))
     cs.append(("MLX-LM fp16", [[PY_MLXLM, BASE, "mlx", "--model", os.path.join(M, "mlx-fp16"), "--prompt-ids", IDS, "--name", "x"]], parse_baseline))
@@ -119,7 +123,7 @@ def main():
              + ", ".join(str(s['load'][0]) for s in states),
              f"- {a.rounds} interleaved rounds, median of per-round values; spread = (max - min) / median.",
              "- Prefill: 512 prompt tokens in one batch. Decode: 128 single-token steps after that prompt, end-of-generation ignored. Same token ids for every row.",
-             "- dooms.cpp runs the text model through llama.cpp's Metal backend (ADR 0003): the rows are expected to be level with llama-bench; the engine adds API, packaging and the other models.",
+             "- dooms.cpp rows: the shipped text engine (the own Metal decoder for f16 llama/qwen2 files, llama.cpp for quantized ones); 'llama.cpp inside' forces llama.cpp.",
              "", "| configuration | prefill tokens/s | spread | decode tokens/s | spread | decode ms/token |", "|---|--:|--:|--:|--:|--:|"]
     for name, _, _ in cs:
         pf, ps = med(name, "prefill_tps")

@@ -2,6 +2,10 @@
 // Status of the C++ call to a dooms_code and stores the message for dooms_last_error().
 #include "dooms/dooms_c.h"
 
+#include <algorithm>
+#include <atomic>
+#include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -10,6 +14,7 @@
 #include <vector>
 
 #include "pipeline/rgb_image.h"
+#include "pipeline/vla_chunk_runner.h"
 #ifdef DOOMS_WITH_LLAMA
 #include "models/vlm/tokenizer.h"
 #include "pipeline/vla_pipeline.h"
@@ -115,15 +120,61 @@ struct dooms_vlm {
 };
 struct dooms_llm {
     std::unique_ptr<dooms::Llm> llm;
+    dooms_llm_generation_info last{};  // what dooms_llm_last_generation reports; struct_size unused here
+};
+// Shared by a dooms_vla and the runner opened on it, so that either may be closed first.
+struct VlaModel {
+    VlaModel(dooms::VlaPipeline p, dooms::Tokenizer t) : pipeline(std::move(p)), tokenizer(std::move(t)) {}
+    dooms::VlaPipeline pipeline;
+    dooms::Tokenizer tokenizer;
+    std::atomic<bool> runner_open{false};  // while set, the pipeline belongs to the runner's worker thread
 };
 struct dooms_vla {
-    std::unique_ptr<dooms::VlaPipeline> pipeline;
-    std::unique_ptr<dooms::Tokenizer> tokenizer;
+    std::shared_ptr<VlaModel> model;
 };
+struct dooms_vla_runner {
+    std::shared_ptr<VlaModel> model;               // declared first: released after the runner has joined its thread
+    std::unique_ptr<dooms::VlaChunkRunner> runner;
+    std::string task;                              // the last task and its tokens, reused while the task does not change
+    std::vector<int32_t> tokens;
+    std::vector<uint8_t> mask;
+    dooms::VlaAction action;
+    std::string last_error;                        // storage behind dooms_vla_runner_stats.last_error
+    ~dooms_vla_runner() {
+        runner.reset();
+        if (model) model->runner_open = false;
+    }
+};
+
+namespace {
+
+dooms_code vla_check_inputs(const dooms::VlaPipeline & p, const dooms_image * cameras, int32_t n_cameras, const char * task, const float * state, int32_t n_state) {
+    if (n_cameras != p.n_cameras() || !cameras) return fail(DOOMS_INVALID_ARGUMENT, "expected " + std::to_string(p.n_cameras()) + " cameras");
+    if (!task || !*task) return fail(DOOMS_INVALID_ARGUMENT, "task is NULL or empty");
+    if (n_state < 0 || n_state > p.state_dim() || (n_state > 0 && !state)) return fail(DOOMS_INVALID_ARGUMENT, "n_state must be in [0, state_dim] and state non-NULL");
+    return DOOMS_OK;
+}
+
+// Cameras and state into `obs` (the caller fills the tokens).
+dooms_code vla_fill_observation(const dooms_image * cameras, int32_t n_cameras, const float * state, int32_t n_state, dooms::VlaObservation * obs) {
+    for (int32_t i = 0; i < n_cameras; i++) {
+        dooms::RgbImage img;
+        dooms_code c = to_rgb_image(&cameras[i], "camera", &img);
+        if (c != DOOMS_OK) return c;
+        auto cam = dooms::camera_from_rgb(img);
+        if (!cam.is_ok()) return from_status(cam.status());
+        obs->cameras.push_back(std::move(cam).value());
+    }
+    if (n_state > 0) obs->state.assign(state, state + n_state);
+    return DOOMS_OK;
+}
+
+}  // namespace
 #else
 struct dooms_vlm {};
 struct dooms_llm {};
 struct dooms_vla {};
+struct dooms_vla_runner {};
 #endif
 
 extern "C" {
@@ -202,6 +253,8 @@ DOOMS_API dooms_code dooms_vlm_generate_stream(dooms_vlm * vlm, const dooms_imag
 }
 
 // ------------------------------------------------------------------------------------------------ LLM
+}  // extern "C"
+
 #ifdef DOOMS_WITH_LLAMA
 namespace {
 
@@ -233,6 +286,20 @@ dooms_code llm_messages(const dooms_chat_message * messages, int32_t n, std::vec
     return DOOMS_OK;
 }
 
+// Runs one generation and records its counts and finish reason for dooms_llm_last_generation (the callers clear the record first, so a failed call leaves DOOMS_FINISH_NONE).
+template <class F>
+dooms_code llm_run(dooms_llm * llm, F && call, std::string * text) {
+    dooms::LlmTimings tm;
+    auto r = call(&tm);
+    if (!r.is_ok()) return from_status(r.status());
+    const dooms::LlmGeneration & g = r.value();
+    llm->last.prompt_tokens = static_cast<int32_t>(tm.prompt_tokens);
+    llm->last.completion_tokens = static_cast<int32_t>(tm.generated_tokens);
+    llm->last.finish_reason = g.cancelled ? DOOMS_FINISH_CANCELLED : g.stopped ? DOOMS_FINISH_STOP : DOOMS_FINISH_LENGTH;
+    if (text) *text = g.text;
+    return DOOMS_OK;
+}
+
 dooms_code llm_write(const std::string & text, char * out, size_t capacity, size_t * needed) {
     if (needed) *needed = text.size() + 1;
     if (!out && capacity > 0) return fail(DOOMS_INVALID_ARGUMENT, "out is NULL");
@@ -243,6 +310,8 @@ dooms_code llm_write(const std::string & text, char * out, size_t capacity, size
 
 }  // namespace
 #endif
+
+extern "C" {
 
 DOOMS_API dooms_code dooms_llm_open(const char * gguf_path, const dooms_llm_options * options, dooms_llm ** out) {
     return guarded([&]() -> dooms_code {
@@ -290,13 +359,15 @@ DOOMS_API dooms_code dooms_llm_generate(dooms_llm * llm, const char * prompt, in
     return guarded([&]() -> dooms_code {
 #ifdef DOOMS_WITH_LLAMA
         if (!llm) return fail(DOOMS_INVALID_ARGUMENT, "llm is NULL");
+        llm->last = dooms_llm_generation_info{};  // a call rejected before it runs must not leave the previous record
         if (!prompt || !*prompt) return fail(DOOMS_INVALID_ARGUMENT, "prompt is NULL or empty");
         dooms::LlmGenerateOptions o;
         dooms_code c = llm_generate_options(sampling, stop, n_stop, max_new_tokens, &o);
         if (c != DOOMS_OK) return c;
-        auto r = llm->llm->generate(prompt, o);
-        if (!r.is_ok()) return from_status(r.status());
-        return llm_write(r.value().text, out, capacity, needed);
+        std::string text;
+        c = llm_run(llm, [&](dooms::LlmTimings * tm) { return llm->llm->generate(prompt, o, nullptr, tm); }, &text);
+        if (c != DOOMS_OK) return c;
+        return llm_write(text, out, capacity, needed);
 #else
         (void) llm; (void) prompt; (void) max_new_tokens; (void) sampling; (void) stop; (void) n_stop; (void) out; (void) capacity; (void) needed;
         return fail(DOOMS_UNSUPPORTED, "this build of dooms.cpp was made without llama.cpp (DOOMS_WITH_LLAMA=OFF)");
@@ -309,13 +380,15 @@ DOOMS_API dooms_code dooms_llm_generate_stream(dooms_llm * llm, const char * pro
     return guarded([&]() -> dooms_code {
 #ifdef DOOMS_WITH_LLAMA
         if (!llm) return fail(DOOMS_INVALID_ARGUMENT, "llm is NULL");
+        llm->last = dooms_llm_generation_info{};  // a call rejected before it runs must not leave the previous record
         if (!callback) return fail(DOOMS_INVALID_ARGUMENT, "callback is NULL");
         if (!prompt || !*prompt) return fail(DOOMS_INVALID_ARGUMENT, "prompt is NULL or empty");
         dooms::LlmGenerateOptions o;
         dooms_code c = llm_generate_options(sampling, stop, n_stop, max_new_tokens, &o);
         if (c != DOOMS_OK) return c;
-        auto r = llm->llm->generate(prompt, o, [&](const std::string & piece) { return callback(piece.c_str(), user) == 0; });
-        return r.is_ok() ? DOOMS_OK : from_status(r.status());
+        return llm_run(llm, [&](dooms::LlmTimings * tm) {
+            return llm->llm->generate(prompt, o, [&](const std::string & piece) { return callback(piece.c_str(), user) == 0; }, tm);
+        }, nullptr);
 #else
         (void) llm; (void) prompt; (void) max_new_tokens; (void) sampling; (void) stop; (void) n_stop; (void) callback; (void) user;
         return fail(DOOMS_UNSUPPORTED, "this build of dooms.cpp was made without llama.cpp (DOOMS_WITH_LLAMA=OFF)");
@@ -328,15 +401,17 @@ DOOMS_API dooms_code dooms_llm_chat(dooms_llm * llm, const dooms_chat_message * 
     return guarded([&]() -> dooms_code {
 #ifdef DOOMS_WITH_LLAMA
         if (!llm) return fail(DOOMS_INVALID_ARGUMENT, "llm is NULL");
+        llm->last = dooms_llm_generation_info{};  // a call rejected before it runs must not leave the previous record
         std::vector<dooms::ChatMessage> msgs;
         dooms_code c = llm_messages(messages, n_messages, &msgs);
         if (c != DOOMS_OK) return c;
         dooms::LlmGenerateOptions o;
         c = llm_generate_options(sampling, stop, n_stop, max_new_tokens, &o);
         if (c != DOOMS_OK) return c;
-        auto r = llm->llm->chat(msgs, o);
-        if (!r.is_ok()) return from_status(r.status());
-        return llm_write(r.value().text, out, capacity, needed);
+        std::string text;
+        c = llm_run(llm, [&](dooms::LlmTimings * tm) { return llm->llm->chat(msgs, o, nullptr, tm); }, &text);
+        if (c != DOOMS_OK) return c;
+        return llm_write(text, out, capacity, needed);
 #else
         (void) llm; (void) messages; (void) n_messages; (void) max_new_tokens; (void) sampling; (void) stop; (void) n_stop; (void) out; (void) capacity; (void) needed;
         return fail(DOOMS_UNSUPPORTED, "this build of dooms.cpp was made without llama.cpp (DOOMS_WITH_LLAMA=OFF)");
@@ -349,6 +424,7 @@ DOOMS_API dooms_code dooms_llm_chat_stream(dooms_llm * llm, const dooms_chat_mes
     return guarded([&]() -> dooms_code {
 #ifdef DOOMS_WITH_LLAMA
         if (!llm) return fail(DOOMS_INVALID_ARGUMENT, "llm is NULL");
+        llm->last = dooms_llm_generation_info{};  // a call rejected before it runs must not leave the previous record
         if (!callback) return fail(DOOMS_INVALID_ARGUMENT, "callback is NULL");
         std::vector<dooms::ChatMessage> msgs;
         dooms_code c = llm_messages(messages, n_messages, &msgs);
@@ -356,10 +432,66 @@ DOOMS_API dooms_code dooms_llm_chat_stream(dooms_llm * llm, const dooms_chat_mes
         dooms::LlmGenerateOptions o;
         c = llm_generate_options(sampling, stop, n_stop, max_new_tokens, &o);
         if (c != DOOMS_OK) return c;
-        auto r = llm->llm->chat(msgs, o, [&](const std::string & piece) { return callback(piece.c_str(), user) == 0; });
-        return r.is_ok() ? DOOMS_OK : from_status(r.status());
+        return llm_run(llm, [&](dooms::LlmTimings * tm) {
+            return llm->llm->chat(msgs, o, [&](const std::string & piece) { return callback(piece.c_str(), user) == 0; }, tm);
+        }, nullptr);
 #else
         (void) llm; (void) messages; (void) n_messages; (void) max_new_tokens; (void) sampling; (void) stop; (void) n_stop; (void) callback; (void) user;
+        return fail(DOOMS_UNSUPPORTED, "this build of dooms.cpp was made without llama.cpp (DOOMS_WITH_LLAMA=OFF)");
+#endif
+    });
+}
+
+DOOMS_API dooms_code dooms_llm_last_generation(const dooms_llm * llm, dooms_llm_generation_info * out) {
+    return guarded([&]() -> dooms_code {
+        if (!llm) return fail(DOOMS_INVALID_ARGUMENT, "llm is NULL");
+        dooms_code c;
+        if (!struct_ok(out, "out", &c)) return c;
+#ifdef DOOMS_WITH_LLAMA
+        dooms_llm_generation_info info = llm->last;
+#else
+        dooms_llm_generation_info info{};
+#endif
+        // copy only what the caller's (possibly older, smaller) struct holds, keeping its struct_size
+        info.struct_size = out->struct_size;
+        std::memcpy(out, &info, std::min(out->struct_size, sizeof info));
+        return DOOMS_OK;
+    });
+}
+
+DOOMS_API dooms_code dooms_llm_count_tokens(dooms_llm * llm, const char * text, int32_t add_special, int32_t * count) {
+    return guarded([&]() -> dooms_code {
+        if (!count) return fail(DOOMS_INVALID_ARGUMENT, "count is NULL");
+        *count = 0;
+        if (!llm) return fail(DOOMS_INVALID_ARGUMENT, "llm is NULL");
+        if (!text || !*text) return fail(DOOMS_INVALID_ARGUMENT, "text is NULL or empty");
+#ifdef DOOMS_WITH_LLAMA
+        auto t = llm->llm->tokenize(text, add_special != 0, /*parse_special=*/false);
+        if (!t.is_ok()) return from_status(t.status());
+        *count = static_cast<int32_t>(t.value().size());
+        return DOOMS_OK;
+#else
+        (void) add_special;
+        return fail(DOOMS_UNSUPPORTED, "this build of dooms.cpp was made without llama.cpp (DOOMS_WITH_LLAMA=OFF)");
+#endif
+    });
+}
+
+DOOMS_API dooms_code dooms_llm_count_chat_tokens(dooms_llm * llm, const dooms_chat_message * messages, int32_t n_messages, int32_t * count) {
+    return guarded([&]() -> dooms_code {
+        if (!count) return fail(DOOMS_INVALID_ARGUMENT, "count is NULL");
+        *count = 0;
+        if (!llm) return fail(DOOMS_INVALID_ARGUMENT, "llm is NULL");
+#ifdef DOOMS_WITH_LLAMA
+        std::vector<dooms::ChatMessage> msgs;
+        dooms_code c = llm_messages(messages, n_messages, &msgs);
+        if (c != DOOMS_OK) return c;
+        auto t = llm->llm->chat_tokens(msgs);
+        if (!t.is_ok()) return from_status(t.status());
+        *count = static_cast<int32_t>(t.value().size());
+        return DOOMS_OK;
+#else
+        (void) messages; (void) n_messages;
         return fail(DOOMS_UNSUPPORTED, "this build of dooms.cpp was made without llama.cpp (DOOMS_WITH_LLAMA=OFF)");
 #endif
     });
@@ -385,8 +517,7 @@ DOOMS_API dooms_code dooms_vla_open(const dooms_vla_paths * paths, const dooms_v
         auto t = dooms::Tokenizer::load(paths->vocab);
         if (!t.is_ok()) return from_status(t.status());
         auto h = std::make_unique<dooms_vla>();
-        h->pipeline = std::make_unique<dooms::VlaPipeline>(std::move(p).value());
-        h->tokenizer = std::make_unique<dooms::Tokenizer>(std::move(t).value());
+        h->model = std::make_shared<VlaModel>(std::move(p).value(), std::move(t).value());
         *out = h.release();
         return DOOMS_OK;
 #else
@@ -402,7 +533,7 @@ DOOMS_API dooms_code dooms_vla_info_get(const dooms_vla * vla, dooms_vla_info * 
     return guarded([&]() -> dooms_code {
 #ifdef DOOMS_WITH_LLAMA
         if (!vla || !out) return fail(DOOMS_INVALID_ARGUMENT, "vla and out must be non-NULL");
-        const dooms::VlaPipeline & p = *vla->pipeline;
+        const dooms::VlaPipeline & p = vla->model->pipeline;
         out->n_cameras = static_cast<int32_t>(p.n_cameras());
         out->chunk_size = static_cast<int32_t>(p.chunk_size());
         out->action_dim = static_cast<int32_t>(p.action_dim());
@@ -420,26 +551,20 @@ DOOMS_API dooms_code dooms_vla_infer(dooms_vla * vla, const dooms_image * camera
     return guarded([&]() -> dooms_code {
 #ifdef DOOMS_WITH_LLAMA
         if (!vla) return fail(DOOMS_INVALID_ARGUMENT, "vla is NULL");
-        dooms::VlaPipeline & p = *vla->pipeline;
-        if (n_cameras != p.n_cameras() || !cameras) return fail(DOOMS_INVALID_ARGUMENT, "expected " + std::to_string(p.n_cameras()) + " cameras");
-        if (!task || !*task) return fail(DOOMS_INVALID_ARGUMENT, "task is NULL or empty");
-        if (n_state < 0 || n_state > p.state_dim() || (n_state > 0 && !state)) return fail(DOOMS_INVALID_ARGUMENT, "n_state must be in [0, state_dim] and state non-NULL");
+        if (vla->model->runner_open)
+            return fail(DOOMS_INVALID_ARGUMENT, "this VLA handle has an open runner (dooms_vla_runner_open), which owns the model: close the runner or open a second handle");
+        dooms::VlaPipeline & p = vla->model->pipeline;
+        dooms_code c = vla_check_inputs(p, cameras, n_cameras, task, state, n_state);
+        if (c != DOOMS_OK) return c;
         const size_t need = static_cast<size_t>(p.chunk_size() * p.action_dim());
         if (!actions || capacity < need) return fail(DOOMS_RESOURCE_EXHAUSTED, "actions must hold chunk_size * action_dim = " + std::to_string(need) + " floats");
         dooms::VlaObservation obs;
-        for (int32_t i = 0; i < n_cameras; i++) {
-            dooms::RgbImage img;
-            dooms_code c = to_rgb_image(&cameras[i], "camera", &img);
-            if (c != DOOMS_OK) return c;
-            auto cam = dooms::camera_from_rgb(img);
-            if (!cam.is_ok()) return from_status(cam.status());
-            obs.cameras.push_back(std::move(cam).value());
-        }
-        auto tokens = vla->tokenizer->encode_task(task, p.tokenizer_max_length());
+        c = vla_fill_observation(cameras, n_cameras, state, n_state, &obs);
+        if (c != DOOMS_OK) return c;
+        auto tokens = vla->model->tokenizer.encode_task(task, p.tokenizer_max_length());
         if (!tokens.is_ok()) return from_status(tokens.status());
         obs.tokens = tokens.value().tokens;
         obs.token_mask = tokens.value().mask;
-        obs.state.assign(state, state + n_state);
         std::vector<float> start;
         if (noise) start.assign(noise, noise + need);
         auto r = noise ? p.infer(obs, &start) : p.infer(obs);
@@ -448,6 +573,181 @@ DOOMS_API dooms_code dooms_vla_infer(dooms_vla * vla, const dooms_image * camera
         return DOOMS_OK;
 #else
         (void) vla; (void) cameras; (void) n_cameras; (void) task; (void) state; (void) n_state; (void) noise; (void) actions; (void) capacity;
+        return fail(DOOMS_UNSUPPORTED, "this build of dooms.cpp was made without llama.cpp (DOOMS_WITH_LLAMA=OFF)");
+#endif
+    });
+}
+
+// ------------------------------------------------------------------------------------------------ VLA runner (asynchronous chunks)
+DOOMS_API dooms_code dooms_vla_runner_options_init(dooms_vla_runner_options * options) {
+    return guarded([&]() -> dooms_code {
+        if (!options) return fail(DOOMS_INVALID_ARGUMENT, "options is NULL");
+        std::memset(options, 0, sizeof *options);
+        options->struct_size = sizeof *options;
+        options->control_hz = dooms::kVlaRunnerDefaultControlHz;
+        options->chunk_size_threshold = dooms::kVlaRunnerDefaultChunkThreshold;
+        options->new_weight = dooms::kVlaRunnerDefaultNewWeight;
+        return DOOMS_OK;
+    });
+}
+
+DOOMS_API dooms_code dooms_vla_aggregate_weight(const char * name, double * new_weight) {
+    return guarded([&]() -> dooms_code {
+        if (!name || !new_weight) return fail(DOOMS_INVALID_ARGUMENT, "name and new_weight must be non-NULL");
+        auto w = dooms::vla_aggregate_weight(name);
+        if (!w.is_ok()) return from_status(w.status());
+        *new_weight = w.value();
+        return DOOMS_OK;
+    });
+}
+
+DOOMS_API dooms_code dooms_vla_runner_open(dooms_vla * vla, const dooms_vla_runner_options * options, dooms_vla_runner ** out) {
+    return guarded([&]() -> dooms_code {
+        if (!out) return fail(DOOMS_INVALID_ARGUMENT, "out is NULL");
+        *out = nullptr;
+#ifdef DOOMS_WITH_LLAMA
+        if (!vla) return fail(DOOMS_INVALID_ARGUMENT, "vla is NULL");
+        dooms::VlaChunkRunnerOptions o;
+        if (options) {
+            dooms_code c;
+            if (!struct_ok(options, "options", &c)) return c;
+            if (options->struct_size < sizeof(dooms_vla_runner_options)) return fail(DOOMS_INVALID_ARGUMENT, "options.struct_size is smaller than dooms_vla_runner_options");
+            o.control_hz = options->control_hz;
+            o.chunk_size_threshold = options->chunk_size_threshold;
+            o.new_weight = options->new_weight;
+        }
+        bool expected = false;
+        if (!vla->model->runner_open.compare_exchange_strong(expected, true))
+            return fail(DOOMS_INVALID_ARGUMENT, "this VLA handle already has an open runner; close it first or open a second handle");
+        auto h = std::make_unique<dooms_vla_runner>();
+        h->model = vla->model;  // from here on the handle's destructor clears runner_open, also on the error path below
+        auto r = dooms::VlaChunkRunner::create(dooms::vla_pipeline_infer_fn(&h->model->pipeline), o);
+        if (!r.is_ok()) return from_status(r.status());
+        h->runner = std::move(r).value();
+        *out = h.release();
+        return DOOMS_OK;
+#else
+        (void) vla; (void) options;
+        return fail(DOOMS_UNSUPPORTED, "this build of dooms.cpp was made without llama.cpp (DOOMS_WITH_LLAMA=OFF)");
+#endif
+    });
+}
+
+DOOMS_API void dooms_vla_runner_close(dooms_vla_runner * runner) { delete runner; }
+
+DOOMS_API dooms_code dooms_vla_runner_wants_observation(dooms_vla_runner * runner, int32_t * wants) {
+    return guarded([&]() -> dooms_code {
+        if (!runner || !wants) return fail(DOOMS_INVALID_ARGUMENT, "runner and wants must be non-NULL");
+#ifdef DOOMS_WITH_LLAMA
+        *wants = runner->runner->wants_observation() ? 1 : 0;
+        return DOOMS_OK;
+#else
+        return fail(DOOMS_UNSUPPORTED, "this build of dooms.cpp was made without llama.cpp (DOOMS_WITH_LLAMA=OFF)");
+#endif
+    });
+}
+
+DOOMS_API dooms_code dooms_vla_runner_submit(dooms_vla_runner * runner, const dooms_image * cameras, int32_t n_cameras, const char * task, const float * state,
+                                             int32_t n_state, double timestamp_s, int32_t * started) {
+    return guarded([&]() -> dooms_code {
+        if (started) *started = 0;
+        if (!runner) return fail(DOOMS_INVALID_ARGUMENT, "runner is NULL");
+#ifdef DOOMS_WITH_LLAMA
+        if (!std::isfinite(timestamp_s)) return fail(DOOMS_INVALID_ARGUMENT, "timestamp_s must be finite");
+        const dooms::VlaPipeline & p = runner->model->pipeline;
+        dooms_code c = vla_check_inputs(p, cameras, n_cameras, task, state, n_state);
+        if (c != DOOMS_OK) return c;
+        // Only this (the control) thread turns "wanted" from true to false, by submitting, so checking first skips converting an unwanted
+        // observation without a race; submit_observation checks again.
+        if (!runner->runner->wants_observation()) return DOOMS_OK;
+        if (runner->task != task) {
+            auto tokens = runner->model->tokenizer.encode_task(task, p.tokenizer_max_length());
+            if (!tokens.is_ok()) return from_status(tokens.status());
+            runner->task = task;
+            runner->tokens = tokens.value().tokens;
+            runner->mask = tokens.value().mask;
+        }
+        dooms::VlaObservation obs;
+        c = vla_fill_observation(cameras, n_cameras, state, n_state, &obs);
+        if (c != DOOMS_OK) return c;
+        obs.tokens = runner->tokens;
+        obs.token_mask = runner->mask;
+        auto r = runner->runner->submit_observation(std::move(obs), timestamp_s);
+        if (!r.is_ok()) return from_status(r.status());
+        if (started) *started = r.value() ? 1 : 0;
+        return DOOMS_OK;
+#else
+        (void) cameras; (void) n_cameras; (void) task; (void) state; (void) n_state; (void) timestamp_s;
+        return fail(DOOMS_UNSUPPORTED, "this build of dooms.cpp was made without llama.cpp (DOOMS_WITH_LLAMA=OFF)");
+#endif
+    });
+}
+
+DOOMS_API dooms_code dooms_vla_runner_next_action(dooms_vla_runner * runner, double now_s, float * action, size_t capacity, dooms_vla_action_info * info) {
+    return guarded([&]() -> dooms_code {
+        if (!runner) return fail(DOOMS_INVALID_ARGUMENT, "runner is NULL");
+        dooms_code c;
+        if (!struct_ok(info, "info", &c)) return c;
+        if (info->struct_size < sizeof(dooms_vla_action_info)) return fail(DOOMS_INVALID_ARGUMENT, "info.struct_size is smaller than dooms_vla_action_info");
+#ifdef DOOMS_WITH_LLAMA
+        const size_t need = static_cast<size_t>(runner->model->pipeline.action_dim());
+        if (!action || capacity < need) return fail(DOOMS_RESOURCE_EXHAUSTED, "action must hold action_dim = " + std::to_string(need) + " floats");
+        dooms::Status st = runner->runner->next_action(now_s, &runner->action);
+        if (!st.is_ok()) return from_status(st);
+        if (runner->action.available && runner->action.values.size() != need) return fail(DOOMS_INTERNAL, "the runner returned an action of the wrong width");
+        info->available = runner->action.available ? 1 : 0;
+        info->skipped = static_cast<int32_t>(std::min<int64_t>(runner->action.skipped, INT32_MAX));
+        info->step = runner->action.step;
+        if (runner->action.available) std::memcpy(action, runner->action.values.data(), need * sizeof(float));
+        return DOOMS_OK;
+#else
+        (void) now_s; (void) action; (void) capacity;
+        return fail(DOOMS_UNSUPPORTED, "this build of dooms.cpp was made without llama.cpp (DOOMS_WITH_LLAMA=OFF)");
+#endif
+    });
+}
+
+DOOMS_API dooms_code dooms_vla_runner_wait_idle(dooms_vla_runner * runner, double timeout_s, int32_t * idle) {
+    return guarded([&]() -> dooms_code {
+        if (idle) *idle = 0;
+        if (!runner) return fail(DOOMS_INVALID_ARGUMENT, "runner is NULL");
+        if (!std::isfinite(timeout_s) || timeout_s < 0) return fail(DOOMS_INVALID_ARGUMENT, "timeout_s must be finite and >= 0");
+#ifdef DOOMS_WITH_LLAMA
+        const bool done = runner->runner->wait_idle(timeout_s);
+        if (idle) *idle = done ? 1 : 0;
+        return DOOMS_OK;
+#else
+        return fail(DOOMS_UNSUPPORTED, "this build of dooms.cpp was made without llama.cpp (DOOMS_WITH_LLAMA=OFF)");
+#endif
+    });
+}
+
+DOOMS_API dooms_code dooms_vla_runner_stats_get(dooms_vla_runner * runner, dooms_vla_runner_stats * out) {
+    return guarded([&]() -> dooms_code {
+        if (!runner) return fail(DOOMS_INVALID_ARGUMENT, "runner is NULL");
+        dooms_code c;
+        if (!struct_ok(out, "out", &c)) return c;
+        if (out->struct_size < sizeof(dooms_vla_runner_stats)) return fail(DOOMS_INVALID_ARGUMENT, "out.struct_size is smaller than dooms_vla_runner_stats");
+#ifdef DOOMS_WITH_LLAMA
+        const dooms::VlaChunkRunnerStats s = runner->runner->stats();
+        out->actions_returned = s.actions_returned;
+        out->waiting_calls = s.waiting_calls;
+        out->stalled_calls = s.stalled_calls;
+        out->late_skipped = s.late_skipped;
+        out->stale_dropped = s.stale_dropped;
+        out->blended = s.blended;
+        out->chunks_received = s.chunks_received;
+        out->chunks_stale = s.chunks_stale;
+        out->inferences_started = s.inferences_started;
+        out->inferences_failed = s.inferences_failed;
+        out->queued = s.queued;
+        out->in_flight = s.in_flight ? 1 : 0;
+        out->last_error_code = to_code(s.last_error.code());
+        out->last_inference_ms = s.last_inference_ms;
+        runner->last_error = s.last_error.is_ok() ? "" : s.last_error.to_string();
+        out->last_error = runner->last_error.c_str();
+        return DOOMS_OK;
+#else
         return fail(DOOMS_UNSUPPORTED, "this build of dooms.cpp was made without llama.cpp (DOOMS_WITH_LLAMA=OFF)");
 #endif
     });

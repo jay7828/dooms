@@ -1,6 +1,7 @@
 // Every number on the site comes from this file, and every value here comes from a benchmark report in the repository.
 // Models: bench/reports/2026-10-15-all-models/report.md (3 interleaved rounds, AC power, Low Power Mode off, load 1.3-1.5).
-// LLM: bench/reports/2026-10-15-llm/report.md once the gated run lands; until then the single-round measurements of 2026-10-15 (marked `provisional`).
+// SmolVLM decode and time to first token: bench/BASELINES.md "Own decoder for text LLMs too" (decode_shootout.sh, 3 interleaved rounds, the engine's own
+// Metal decoder). LLM: bench/reports/2026-10-15-llm-metal/report.md (run_llm.py, 2 interleaved rounds).
 // Machine: Apple M1 Pro (6 performance + 2 efficiency cores, 14-core GPU, 16 GB), macOS 26.6.
 
 window.DOOMS = {
@@ -44,34 +45,38 @@ window.DOOMS = {
       { sys: "pytorch", name: "PyTorch MPS fp32", ms: 106.2 },
     ],
     ttft: [
-      { sys: "dooms", name: "dooms.cpp", ms: 92.5 },
-      { sys: "mlx", name: "MLX fp16", ms: 97.3 },
+      { sys: "dooms", name: "dooms.cpp", ms: 82.5 },
+      { sys: "mlx", name: "MLX fp16", ms: 97.0 },
       { sys: "pytorch", name: "PyTorch MPS fp16", ms: 139.4 },
     ],
     decode: [
-      { sys: "mlx", name: "MLX fp16", ms: 3.41 },
-      { sys: "llama", name: "llama.cpp, text model alone", ms: 4.12 },
-      { sys: "dooms", name: "dooms.cpp", ms: 4.58 },
-      { sys: "pytorch", name: "PyTorch CPU fp32", ms: 29.66 },
+      { sys: "dooms", name: "dooms.cpp, own Metal decoder", ms: 2.70 },
+      { sys: "mlx", name: "MLX fp16", ms: 3.44 },
+      { sys: "llama", name: "llama.cpp, text model alone", ms: 4.11 },
+      { sys: "pytorch", name: "PyTorch MPS fp32", ms: 27.29 },
     ],
   },
 
   // Qwen2.5-0.5B-Instruct, 512-token prompt, 128 greedy tokens after it
   llm: {
-    provisional: true,
+    provisional: false,
     decode: [
-      { sys: "mlx", name: "MLX-LM 4-bit", tps: 212.4 },
-      { sys: "llama", name: "llama.cpp Q4_K_M", tps: 164.2 },
-      { sys: "mlx", name: "MLX-LM fp16", tps: 136.3 },
-      { sys: "llama", name: "llama.cpp f16", tps: 130.4 },
-      { sys: "dooms", name: "dooms.cpp f16", tps: 129.0 },
-      { sys: "pytorch", name: "PyTorch MPS fp16", tps: 37.5 },
+      { sys: "dooms", name: "dooms.cpp f16, own Metal decoder", tps: 137.9 },
+      { sys: "mlx", name: "MLX-LM fp16", tps: 136.2 },
+      { sys: "llama", name: "llama.cpp f16", tps: 130.7 },
+      { sys: "pytorch", name: "PyTorch MPS fp16", tps: 37.6 },
+    ],
+    // 4-bit rows are a different precision: shown apart, never ranked against f16
+    decode4: [
+      { sys: "mlx", name: "MLX-LM 4-bit", tps: 211.6 },
+      { sys: "llama", name: "llama.cpp Q4_K_M", tps: 164.9 },
+      { sys: "dooms", name: "dooms.cpp Q4_K_M (llama.cpp inside)", tps: 161.5 },
     ],
     prefill: [
-      { sys: "llama", name: "llama.cpp f16", tps: 4606 },
-      { sys: "dooms", name: "dooms.cpp f16", tps: 4493 },
-      { sys: "mlx", name: "MLX-LM fp16", tps: 3881 },
-      { sys: "pytorch", name: "PyTorch MPS fp16", tps: 2508 },
+      { sys: "llama", name: "llama.cpp f16", tps: 4604 },
+      { sys: "dooms", name: "dooms.cpp f16, own Metal decoder", tps: 3999 },
+      { sys: "mlx", name: "MLX-LM fp16", tps: 3864 },
+      { sys: "pytorch", name: "PyTorch MPS fp16", tps: 2492 },
     ],
   },
 
@@ -86,6 +91,21 @@ window.DOOMS = {
 
   // what changed, measured before and after
   log: [
+    {
+      title: "Our own text decoder",
+      body: "Hand-written Metal kernels for llama and Qwen2 models: five kernels per layer instead of about fifteen, the greedy token picked on the GPU, and the next step reading it from GPU memory, so decode steps queue without the CPU in between.",
+      before: 4.58, after: 2.70, unit: "ms/token", what: "SmolVLM decode",
+    },
+    {
+      title: "Flash attention for the prompt",
+      body: "The prompt's attention ran one query at a time. A flash-attention kernel on the matrix units (32 queries per threadgroup, a running softmax) removed most of it.",
+      before: 72.6, after: 13.9, unit: "ms", what: "attention, 512-token prompt",
+    },
+    {
+      title: "Prompt matmuls like llama.cpp's",
+      body: "Our first prefill kernel used 16x16 tiles. Borrowing the structure of llama.cpp's kernel_mul_mm (64x32 tiles, 8x8-blocked operands, fully unrolled) plus our own fused norms and epilogues more than halved the prompt.",
+      before: 315, after: 128, unit: "ms", what: "Qwen2.5 512-token prefill",
+    },
     {
       title: "A persistent CPU thread pool",
       body: "Without one, ggml starts and joins its worker threads for every graph it computes, which is every generated token. Attaching a pool to the llama.cpp context removed that.",

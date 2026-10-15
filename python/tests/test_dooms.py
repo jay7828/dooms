@@ -71,6 +71,13 @@ class ErrorPaths(unittest.TestCase):
             dooms.VLA.from_dir("/nonexistent")
 
 
+    def test_aggregate_names_follow_lerobot(self):
+        self.assertEqual([dooms.aggregate_weight(n) for n in ("weighted_average", "latest_only", "average", "conservative")], [0.7, 1.0, 0.5, 0.3])
+        with self.assertRaises(dooms.DoomsError) as cm:
+            dooms.aggregate_weight("median")
+        self.assertEqual(cm.exception.code, "InvalidArgument")
+        self.assertIn("weighted_average", str(cm.exception))
+
     def test_images_must_be_uint8_rgb(self):
         from dooms import _image  # noqa: PLC0415
         for bad in (np.zeros((4, 4), np.uint8), np.zeros((4, 4, 3), np.float32), np.zeros((4, 4, 4), np.uint8)):
@@ -187,6 +194,70 @@ class Vla(unittest.TestCase):
             self.vla.infer(cams, "x", np.zeros(self.vla.state_dim + 1))
         with self.assertRaises(ValueError):
             self.vla.infer(cams, "x", self.ref["state"], noise=np.zeros((2, 2)))
+
+
+@unittest.skipUnless(have("smolvla/prefix-fp16.mlpackage", "smolvla/reference.npz", "smolvla/vocab.gguf"), "SmolVLA files not available")
+class VlaRunner(unittest.TestCase):
+    """The asynchronous runner on the real model, on a synthetic 30 Hz clock (the splicing math itself is tested in C++ against a fake model)."""
+    TASK = "pick up the red cube and place it in the box"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.vla = dooms.VLA.from_dir(os.path.join(MODELS, "smolvla"), seed=11)
+        ref = dict(np.load(os.path.join(MODELS, "smolvla", "reference.npz")))
+        cls.cams = [np.round(ref[f"image_camera{k}"] * 255).astype(np.uint8).transpose(1, 2, 0) for k in (1, 2, 3)]
+        cls.state = ref["state"]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.vla.close()
+
+    def test_bad_options_are_invalid_argument(self):
+        for kwargs in ({"control_hz": 0}, {"chunk_size_threshold": 1.5}, {"aggregate": -0.1}):
+            with self.assertRaises(dooms.DoomsError) as cm:
+                self.vla.runner(**kwargs)
+            self.assertEqual(cm.exception.code, "InvalidArgument")
+        with self.assertRaises(dooms.DoomsError):
+            self.vla.runner(aggregate="median")
+
+    def test_control_loop_without_gaps(self):
+        hz = 30.0
+        with self.vla.runner(control_hz=hz, chunk_size_threshold=0.5, aggregate="weighted_average") as r:
+            self.assertEqual((r.control_hz, r.chunk_size_threshold, r.new_weight), (30.0, 0.5, 0.7))
+            # the model belongs to the runner's thread while it is open
+            with self.assertRaises(dooms.DoomsError) as cm:
+                self.vla.infer(self.cams, self.TASK, self.state)
+            self.assertIn("runner", str(cm.exception))
+            with self.assertRaises(dooms.DoomsError):
+                self.vla.runner()
+            self.assertIsNone(r.next_action(0.0))
+            self.assertTrue(r.wants_observation())
+            with self.assertRaises(ValueError):
+                r.submit(self.cams[:2], self.TASK, self.state, 0.0)
+            self.assertTrue(r.submit(self.cams, self.TASK, self.state, 0.0))
+            self.assertFalse(r.submit(self.cams, self.TASK, self.state, 0.0))  # one in flight
+            self.assertTrue(r.wait_idle(600))
+            steps = []
+            for k in range(80):
+                now = k / hz
+                a = r.next_action(now)
+                self.assertIsNotNone(a)
+                self.assertEqual(a.shape, (self.vla.action_dim,))
+                self.assertTrue(np.isfinite(a).all())
+                steps.append(r.step)
+                if r.wants_observation():
+                    self.assertTrue(r.submit(self.cams, self.TASK, self.state, now))
+                    self.assertTrue(r.wait_idle(600))
+            self.assertEqual(steps, list(range(80)))
+            st = r.stats()
+            self.assertEqual((st.actions_returned, st.stalled_calls, st.inferences_failed, st.last_error), (80, 0, 0, None))
+            self.assertEqual((st.chunks_received, st.blended, st.stale_dropped), (4, 75, 3))  # observations at steps 24, 48, 72
+            with self.assertRaises(dooms.DoomsError):
+                r.next_action(0.0)  # time went backwards
+        with self.assertRaises(ValueError):
+            r.next_action()
+        # closed: the handle infers again
+        self.assertEqual(self.vla.infer(self.cams, self.TASK, self.state).shape, (self.vla.chunk_size, self.vla.action_dim))
 
 
 

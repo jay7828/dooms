@@ -5,7 +5,8 @@ Apple Silicon macOS only (ADR 0005). Models are never bundled: bring a GGUF for 
 ## Python
 
 ```
-pip install dooms-0.2.0-py3-none-macosx_11_0_arm64.whl      # from scripts/package-python.sh; needs numpy
+pip install https://github.com/jay7828/dooms/releases/download/v0.3.0/dooms_cpp-0.3.0-py3-none-macosx_14_0_arm64.whl   # or your own build: scripts/package-python.sh; needs numpy
+                                                               # once released: pip install dooms-cpp (import name and command: dooms)
 ```
 
 ```python
@@ -28,8 +29,8 @@ string. Each call is a fresh conversation. Errors raise `dooms.DoomsError` (`.co
 ## C++
 
 ```
-tar xzf dooms-sdk-0.2.0-macos-arm64.tar.gz           # from scripts/package-sdk.sh
-cmake -S examples/cpp -B build -DCMAKE_PREFIX_PATH=$PWD/dooms-sdk-0.2.0-macos-arm64
+curl -LO https://github.com/jay7828/dooms/releases/download/v0.3.0/dooms-sdk-0.3.0-macos-arm64.tar.gz && tar xzf dooms-sdk-0.3.0-macos-arm64.tar.gz   # or scripts/package-sdk.sh
+cmake -S examples/cpp -B build -DCMAKE_PREFIX_PATH=$PWD/dooms-sdk-0.3.0-macos-arm64
 ```
 
 ```cpp
@@ -40,7 +41,7 @@ llm.generate("Once upon a time", 100, {0.8f, 40, 0.95f, 1.0f, /*seed*/ 1}, {"\n\
              [](const std::string & piece) { std::cout << piece << std::flush; return true; });   // return false to stop
 ```
 
-CMake: `find_package(dooms 0.2 REQUIRED)` then `target_link_libraries(app PRIVATE dooms::dooms)`. pkg-config: `dooms.pc`. Plain C: `dooms_c.h` (stable, append-only; `dooms_llm_*`,
+CMake: `find_package(dooms 0.3 REQUIRED)` then `target_link_libraries(app PRIVATE dooms::dooms)`. pkg-config: `dooms.pc`. Plain C: `dooms_c.h` (stable, append-only; `dooms_llm_*`,
 
 ## Command line
 
@@ -50,7 +51,65 @@ dooms-cli llm --model model.gguf --raw --prompt "Once upon a time" --temp 0.8 --
 dooms-cli vlm --image photo.jpg --prompt "Describe this image." --models models/smolvlm
 ```
 
+## OpenAI-compatible server
+
+The wheel installs a `dooms` command (also `python -m dooms`). `dooms serve` puts one text GGUF behind OpenAI's HTTP API (standard library only, no extra dependency):
+
+```
+dooms serve --model qwen2.5-0.5b-instruct-q4_k_m.gguf [--host 127.0.0.1] [--port 8080] [--n-ctx 4096] [--model-name qwen]
+```
+
+Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `POST /v1/completions`, with `"stream": true` as Server-Sent Events (`data: {...}` chunks, then
+`data: [DONE]`; `"stream_options": {"include_usage": true}` adds a final usage chunk).
+
+```
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "qwen", "messages": [{"role": "user", "content": "Name three colours."}], "temperature": 0, "max_tokens": 48}'
+curl -N http://127.0.0.1:8080/v1/completions -H 'Content-Type: application/json' \
+  -d '{"model": "qwen", "prompt": "Once upon a time", "max_tokens": 64, "stream": true}'
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")      # no authentication: keep --host on 127.0.0.1 unless the network is trusted
+r = client.chat.completions.create(model="qwen", messages=[{"role": "user", "content": "Name three colours."}], max_tokens=48)
+print(r.choices[0].message.content, r.usage)
+for chunk in client.chat.completions.create(model="qwen", messages=[{"role": "user", "content": "Tell a story."}], stream=True):
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+- Parameters: `max_tokens` / `max_completion_tokens` (default: the rest of the context), `temperature` (default 1, 0 is greedy), `top_p` (default 1), `seed` (reduced modulo
+  2^32; without it each request draws a random one), `stop` (a string or up to 4). `frequency_penalty` / `presence_penalty` are accepted only at 0, their no-op value.
+- Rejected with a 400 and OpenAI's error object (`{"error": {"message", "type", "param", "code"}}`): `n` > 1, tools / function calling, logprobs, images or audio, JSON
+  response formats, `logit_bias`, `echo`, `suffix`, several prompts per request, unknown parameters. A `model` other than the served name is a 404; omitting it is allowed.
+- `usage` holds the real token counts (`completion_tokens` includes the end-of-generation token); `finish_reason` is `"length"` only when the token limit was hit.
+- One model, one request at a time (the handle is not thread-safe): concurrent requests wait their turn. A client that disconnects during a stream stops its generation.
+- The model's own chat template formats `messages` (`developer` is treated as `system`; a list of text parts is joined with newlines).
+
 ## Getting a model
+
+`dooms pull` downloads a model from Hugging Face and checks it against the hash Hugging Face publishes for the file (SHA-256 for LFS files). Downloads are resumable
+(`<file>.part`, HTTP Range; a broken connection is resumed automatically, and running the command again continues where it stopped), the file appears under its
+final name only once verified, and a checksum mismatch deletes the partial file. Progress goes to stderr, the path of the model to stdout.
+
+```
+dooms pull qwen2.5-0.5b                          # aliases, each pinned to a commit of the publisher's own repository: qwen2.5-0.5b, qwen2.5-1.5b, qwen3-0.6b,
+                                                 #   smollm2-1.7b, gemma-3-1b (ggml-org; Gemma licence)   (dooms pull --help lists them)
+dooms pull hf:Qwen/Qwen2.5-1.5B-Instruct-GGUF/qwen2.5-1.5b-instruct-q8_0.gguf[@REVISION]   # any GGUF file of any repository
+dooms serve --model "$(dooms pull qwen2.5-0.5b)"
+dooms list                                       # what is in the models directory
+```
+
+- The models directory is `--dir DIR`, else `$DOOMS_MODELS`, else `~/.cache/dooms`. `HF_TOKEN` is sent for gated or private repositories (to Hugging Face only, never to
+  the CDN a download is redirected to); `HF_ENDPOINT` points at a mirror.
+- `dooms pull smolvlm` / `dooms pull smolvla`: these run from Core ML packages and GGUF files converted on your machine, never redistributed (licensing, see the NOTICE).
+  `pull` downloads the **original** weights from the official repositories (HuggingFaceTB/SmolVLM-256M-Instruct; HuggingFaceTB/SmolVLM2-500M-Video-Instruct and
+  lerobot/smolvla_base), pinned to a commit and verified, into `<dir>/sources/`, runs the converters of `tools/convert` into `<dir>/smolvlm` (or `smolvla`), checks that
+  the result loads, and only then moves it into place. This needs a source checkout (built once, which fetches llama.cpp) and its converter environment:
+  `.venv` with torch, coremltools, transformers, gguf, safetensors, huggingface_hub (plus `.venv-lerobot` with LeRobot for SmolVLA); run
+  `PYTHONPATH=python .venv/bin/python -m dooms pull smolvlm` there. Override with `DOOMS_SOURCE_DIR`, `DOOMS_CONVERT_PYTHON`, `DOOMS_LEROBOT_PYTHON`,
+  `DOOMS_LLAMA_CPP_DIR`. From a wheel install it stops with these instructions.
+- By hand, any Hugging Face checkpoint llama.cpp supports:
 
 ```
 python build/_deps/llama_cpp-src/convert_hf_to_gguf.py Qwen2.5-0.5B-Instruct --outfile qwen-f16.gguf --outtype f16

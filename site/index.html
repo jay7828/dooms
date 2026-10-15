@@ -78,7 +78,7 @@
     <section class="bench wrap" id="bench">
       <div class="bench-head">
         <h2 class="rise-in">Benchmarks</h2>
-        <p class="section-body">Median of three interleaved rounds per configuration, one process each, on an idle machine plugged in. The baselines run their fastest setting on the same machine.</p>
+        <p class="section-body">Median of interleaved rounds (three, or two for the LLM) per configuration, one process each, plugged in, nothing else on the GPU. The baselines run their fastest setting on the same machine.</p>
       </div>
       <div class="tabs" role="tablist" aria-label="Benchmark">
         <button role="tab" aria-selected="true" data-tab="vla">SmolVLA</button>
@@ -108,12 +108,12 @@
       <h2 class="rise-in">Where it loses</h2>
       <div class="loss-grid">
         <div class="loss rise-in">
-          <div class="loss-num"><span data-count="3.41">3.41</span> vs <span data-count="4.58">4.58</span></div>
-          <p>ms per token, SmolVLM decode against MLX. The gap sits inside llama.cpp's Metal decode path, which runs the engine's text model.</p>
+          <div class="loss-num"><span data-count="4604">4604</span> vs <span data-count="3999">3999</span></div>
+          <p>tokens per second on a 512-token prompt, llama.cpp against the engine's own decoder (Qwen2.5-0.5B, f16). Decode is ahead; the prompt is not yet.</p>
         </div>
         <div class="loss rise-in">
           <div class="loss-num"><span data-count="212">212</span> vs <span data-count="164">164</span></div>
-          <p>tokens per second at 4-bit, MLX-LM against llama.cpp's Q4_K_M. The engine inherits llama.cpp's number.</p>
+          <p>tokens per second at 4-bit, MLX-LM against llama.cpp's Q4_K_M. Quantized files run on llama.cpp inside the engine, so it inherits that number.</p>
         </div>
         <div class="loss rise-in">
           <div class="loss-num"><span data-count="15" data-suffix="x">15x</span></div>
@@ -143,7 +143,7 @@
       </div>
       <div class="code-card">
         <button class="copy" type="button" aria-label="Copy code"><i class="ph ph-copy"></i></button>
-<pre data-code="py"><code><span class="c"># pip install dooms-0.2.0-py3-none-macosx_11_0_arm64.whl</span>
+<pre data-code="py"><code><span class="c"># pip install https://github.com/jay7828/dooms/releases/download/v0.3.0/dooms_cpp-0.3.0-py3-none-macosx_14_0_arm64.whl</span>
 import dooms
 
 llm = dooms.LLM("qwen2.5-0.5b-instruct-q4_k_m.gguf")
@@ -154,7 +154,7 @@ for piece in llm.stream("Once upon a time", 200, temperature=0.8, seed=1):
 
 vla = dooms.VLA.from_dir("models/smolvla")
 actions = vla.infer([cam1, cam2, cam3], "pick up the red cube", state)</code></pre>
-<pre data-code="cpp" hidden><code><span class="c">// find_package(dooms 0.2 REQUIRED)  target_link_libraries(app PRIVATE dooms::dooms)</span>
+<pre data-code="cpp" hidden><code><span class="c">// find_package(dooms 0.3 REQUIRED)  target_link_libraries(app PRIVATE dooms::dooms)</span>
 #include &lt;dooms/dooms.hpp&gt;
 
 dooms::Llm llm("qwen2.5-0.5b-instruct-q4_k_m.gguf");

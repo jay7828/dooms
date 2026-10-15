@@ -5,6 +5,7 @@
 #include <future>
 
 #include "format/gguf.h"
+#include "pipeline/native_llama.h"
 
 namespace dooms {
 
@@ -25,6 +26,8 @@ Result<T> unwrap(Result<T> r, const char * what) {
 struct VlmPipeline::Impl {
     std::unique_ptr<CoreMlModel> vision;
     std::unique_ptr<TextDecoder> text;
+    std::unique_ptr<MetalLlamaDecoder> native;  // set when options.text_engine == "metal"; `text` then only tokenizes
+    int32_t queue_depth = 1;
     VlmImageOptions image_options;
     std::string prefix, infix, suffix;
     int64_t n_image = 0, embedding_dim = 0, image_token_id = 0;
@@ -38,6 +41,7 @@ VlmPipeline & VlmPipeline::operator=(VlmPipeline &&) noexcept = default;
 VlmPipeline::~VlmPipeline() = default;
 
 int64_t VlmPipeline::n_image_tokens() const { return impl_->n_image; }
+const char * VlmPipeline::text_engine_used() const { return impl_->native ? "metal" : "llama.cpp"; }
 int64_t VlmPipeline::embedding_dim() const { return impl_->embedding_dim; }
 const VlmImageOptions & VlmPipeline::image_options() const { return impl_->image_options; }
 
@@ -97,7 +101,28 @@ Result<VlmPipeline> VlmPipeline::create(const VlmPaths & paths, const VlmOptions
         return invalid_argument("the vision package must produce one output 'image_embeddings' of shape " + impl->output_shape.to_string());
     }
 
-    auto text = TextDecoder::load(paths.text, options.text);
+    if (options.text_engine != "auto" && options.text_engine != "llama.cpp" && options.text_engine != "metal") {
+        return invalid_argument("text_engine must be \"auto\", \"metal\" or \"llama.cpp\", got \"" + options.text_engine + "\"");
+    }
+    if (options.metal_queue_depth < 1) return invalid_argument("metal_queue_depth must be >= 1");
+    TextDecoderOptions text_options = options.text;
+    if (options.text_engine != "llama.cpp") {
+        NativeLlamaOptions no;
+        no.n_ctx = options.text.n_ctx;
+        no.n_batch = options.text.n_batch;
+        no.spin_wait = options.metal_spin_wait;
+        auto native = load_native_llama(paths.text, no);
+        // "auto" falls back to llama.cpp only for files the own decoder does not run; a missing or broken file is an error either way.
+        if (!native.is_ok() && (options.text_engine == "metal" || native.status().code() != Code::Unsupported)) {
+            return Status(native.status().code(), "text_engine \"" + options.text_engine + "\": " + native.status().message());
+        }
+        if (native.is_ok()) impl->native = std::move(native).value();
+    }
+    if (impl->native) {
+        impl->queue_depth = options.metal_queue_depth;
+        text_options.vocab_only = true;  // llama.cpp only tokenizes: no weights, no context, no worker threads competing with preprocessing
+    }
+    auto text = TextDecoder::load(paths.text, text_options);
     if (!text.is_ok()) return text.status();
     impl->text = std::make_unique<TextDecoder>(std::move(text).value());
     if (impl->text->embedding_dim() != impl->embedding_dim) {
@@ -145,6 +170,48 @@ Result<VlmGeneration> VlmPipeline::generate(const RgbImage & image, const std::s
     return r;
 }
 
+namespace {
+
+// The Metal decoder's path: the whole prompt as one embedding sequence, then pipelined greedy decoding (the GPU reads each step's input token itself).
+Result<VlmGeneration> generate_native(TextDecoder & vocab, MetalLlamaDecoder & native, int64_t embedding_dim, int32_t queue_depth, const std::vector<float> & image, const std::vector<int32_t> & before, const std::vector<int32_t> & after,
+                                      int max_new_tokens, const std::function<bool(const std::string &)> & on_text, VlmTimings * timings, VlmTimings tm,
+                                      Clock::time_point t0) {
+    auto head = vocab.embed_tokens(before);
+    auto tail = vocab.embed_tokens(after);
+    if (!head.is_ok()) return head.status();
+    if (!tail.is_ok()) return tail.status();
+    std::vector<float> all;
+    all.reserve(head.value().size() + image.size() + tail.value().size());
+    all.insert(all.end(), head.value().begin(), head.value().end());
+    all.insert(all.end(), image.begin(), image.end());
+    all.insert(all.end(), tail.value().begin(), tail.value().end());
+    native.reset();
+    Status st = native.eval_embeddings(all.data(), static_cast<int32_t>(all.size() / static_cast<size_t>(embedding_dim)));
+    if (!st.is_ok()) return st;
+    VlmGeneration gen;
+    auto t_decode = Clock::now();
+    st = native.generate(max_new_tokens, queue_depth, [&](int32_t token) {
+        if (gen.tokens.empty()) {
+            // The first token is ready once the prefill has run: the GPU works asynchronously, so this is where its time shows.
+            tm.prefill_ms = tm.first_token_ms = ms_since(t0);
+            t_decode = Clock::now();
+        }
+        gen.tokens.push_back(token);
+        if (vocab.is_end_of_generation(token)) { gen.stopped = true; return false; }
+        const std::string piece = vocab.piece(token);
+        gen.text += piece;
+        if (on_text && !on_text(piece)) { gen.cancelled = true; return false; }
+        return true;
+    });
+    if (!st.is_ok()) return st;
+    tm.generated_tokens = static_cast<int64_t>(gen.tokens.size());
+    tm.decode_ms = ms_since(t_decode);
+    if (timings) *timings = tm;
+    return gen;
+}
+
+}  // namespace
+
 Result<VlmGeneration> VlmPipeline::generate_from_embeddings(const std::vector<float> & embeddings, const std::string & prompt, int max_new_tokens,
                                                             const std::function<bool(const std::string &)> & on_text, VlmTimings * timings) {
     Impl & m = *impl_;
@@ -162,6 +229,7 @@ Result<VlmGeneration> VlmPipeline::generate_from_embeddings(const std::vector<fl
     if (tm.prompt_tokens + max_new_tokens > m.text->context_size()) {
         return resource_exhausted("the prompt (" + std::to_string(tm.prompt_tokens) + " tokens including the image) plus " + std::to_string(max_new_tokens) + " new tokens exceed the context of " + std::to_string(m.text->context_size()));
     }
+    if (m.native) return generate_native(*m.text, *m.native, m.embedding_dim, m.queue_depth, embeddings, before.value(), after.value(), max_new_tokens, on_text, timings, tm, t0);
     m.text->reset();
     Status st;
     // One model call for the whole prompt when the token embedding table can be read (f32/f16/bf16 models): the prompt is then a single embedding sequence

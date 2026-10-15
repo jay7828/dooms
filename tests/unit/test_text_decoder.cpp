@@ -244,4 +244,96 @@ TEST(embedded_tokens_equal_token_evaluation) {
     EXPECT(!d.embed_tokens({static_cast<int32_t>(d.vocab_size())}).is_ok());
 }
 
+// Greedy decoding with the token picked on the GPU (llama.cpp backend sampling) must produce exactly the tokens of the host argmax: same model, same
+// logits, only where the argmax runs differs. Also checks the mode switches: logits() is refused while it is active, a sampling session detaches it,
+// and a greedy session attaches it again.
+TEST(device_greedy_sampling_equals_host_argmax) {
+    const std::string dir = vlm_dir();
+    if (dir.empty()) { std::printf("        (skipped: set DOOMS_VLM_DIR)\n"); return; }
+    TextDecoderOptions with_device;
+    with_device.device_sampling = true;
+    auto host = TextDecoder::load(dir + "/text-f16.gguf");
+    auto dev = TextDecoder::load(dir + "/text-f16.gguf", with_device);
+    EXPECT(host.is_ok() && dev.is_ok());
+    if (!host.is_ok() || !dev.is_ok()) return;
+    EXPECT(!host.value().device_sampling_active());
+    EXPECT(dev.value().device_sampling_active());
+    constexpr int kTokens = 64;  // long enough for a wrong cache position or a stale token to show
+    const char * prompts[] = {"The quick brown fox", "Write a short poem about the sea.", "1, 2, 3, 4,"};
+    for (const char * prompt : prompts) {
+        std::vector<int32_t> out[2];
+        TextDecoder * decs[2] = {&host.value(), &dev.value()};
+        for (int k = 0; k < 2; k++) {
+            TextDecoder & d = *decs[k];
+            d.reset();
+            EXPECT(d.start_sampling(SamplerOptions()).is_ok());
+            EXPECT(d.eval_tokens(d.tokenize(prompt, false, true).value()).is_ok());
+            for (int t = 0; t < kTokens; t++) {
+                auto next = d.sample_next();
+                EXPECT(next.is_ok());
+                if (!next.is_ok()) break;
+                out[k].push_back(next.value());
+                EXPECT(d.eval_tokens({next.value()}).is_ok());
+            }
+        }
+        EXPECT(out[0].size() == static_cast<size_t>(kTokens));
+        EXPECT(out[0] == out[1]);
+    }
+    TextDecoder & d = dev.value();
+    EXPECT(!d.logits().is_ok());
+    EXPECT(d.logits().status().code() == Code::Unsupported);
+    SamplerOptions creative;
+    creative.temperature = 0.8f;
+    creative.seed = 7;
+    EXPECT(d.start_sampling(creative).is_ok());
+    EXPECT(!d.device_sampling_active());
+    EXPECT(d.eval_tokens(d.tokenize("Hello", false, true).value()).is_ok());
+    EXPECT(d.logits().is_ok());
+    EXPECT(d.sample_next().is_ok());
+    EXPECT(d.start_sampling(SamplerOptions()).is_ok());
+    EXPECT(d.device_sampling_active());
+    // Results from before the switch are not reused: a token must be evaluated again.
+    EXPECT(!d.greedy_next().is_ok());
+    EXPECT(d.eval_tokens(d.tokenize("Hello", false, true).value()).is_ok());
+    EXPECT(d.greedy_next().is_ok());
+}
+
+TEST(vocab_only_load_tokenizes_and_refuses_to_evaluate) {
+    const std::string dir = vlm_dir();
+    if (dir.empty()) { std::printf("        (skipped: set DOOMS_VLM_DIR)\n"); return; }
+    TextDecoderOptions vo;
+    vo.vocab_only = true;
+    auto v = TextDecoder::load(dir + "/text-f16.gguf", vo);
+    auto full = TextDecoder::load(dir + "/text-f16.gguf");
+    EXPECT(v.is_ok() && full.is_ok());
+    if (!v.is_ok() || !full.is_ok()) return;
+    const std::string text = "<|im_start|>User: what is in the image?<end_of_utterance>";
+    EXPECT(v.value().tokenize(text, true).value() == full.value().tokenize(text, true).value());
+    EXPECT_EQ(v.value().embedding_dim(), full.value().embedding_dim());
+    EXPECT(v.value().embed_tokens({1, 2, 3}).value() == full.value().embed_tokens({1, 2, 3}).value());
+    EXPECT_EQ(v.value().piece(42), full.value().piece(42));
+    v.value().reset();
+    EXPECT(v.value().eval_tokens({1}).code() == Code::Unsupported);
+    EXPECT(v.value().greedy_next().status().code() == Code::Unsupported);
+    // Sampling from logits computed elsewhere works without a model: greedy is the argmax, and a seeded session is reproducible.
+    EXPECT(v.value().start_sampling(SamplerOptions()).is_ok());
+    std::vector<float> lg(static_cast<size_t>(v.value().vocab_size()), 0.f);
+    lg[1234] = 5.f;
+    EXPECT_EQ(v.value().sample_logits(lg.data()).value(), 1234);
+    EXPECT(v.value().sample_next().status().code() == Code::Unsupported);
+    SamplerOptions so;
+    so.temperature = 1.f;
+    so.seed = 3;
+    for (size_t i = 0; i < lg.size(); i++) lg[i] = static_cast<float>(i % 17) * 0.1f;
+    std::vector<int32_t> a, b;
+    EXPECT(v.value().start_sampling(so).is_ok());
+    for (int i = 0; i < 5; i++) a.push_back(v.value().sample_logits(lg.data()).value());
+    EXPECT(v.value().start_sampling(so).is_ok());
+    for (int i = 0; i < 5; i++) b.push_back(v.value().sample_logits(lg.data()).value());
+    EXPECT(a == b);
+    EXPECT(!v.value().sample_logits(nullptr).is_ok());
+    vo.device_sampling = true;
+    EXPECT(!TextDecoder::load(dir + "/text-f16.gguf", vo).is_ok());
+}
+
 int main() { return dooms_test::run_all(); }

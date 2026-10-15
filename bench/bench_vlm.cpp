@@ -1,6 +1,8 @@
 // Latency of the SmolVLM pipeline (photo + question -> answer) on one photo, split into the stages that matter.
 //
-//   bench_vlm --models DIR --image photo.jpg [--prompt TEXT] [--max-tokens N] [--vision-units U] [--text FILE] [--threads N] [--warmup N] [--iters N] [--stream N] [--decode-only 1]
+//   bench_vlm --models DIR --image photo.jpg [--prompt TEXT] [--max-tokens N] [--vision-units U] [--text FILE] [--threads N] [--warmup N] [--iters N] [--stream N] [--decode-only 1] [--device-sampling 0|1] [--text-engine auto|metal|llama.cpp] [--queue-depth N] [--pause-ms N] [--spin-wait 0|1]
+// --pause-ms N sleeps N ms between runs (an idle gap like separate requests have; back to back, an engine that keeps CPU threads spinning starts the next
+// run's CPU preprocessing on warmer cores).
 // --decode-only 1 encodes the photo once and times only the language-model part (prefill + decode) on those embeddings, to separate it from the vision stage.
 // --stream N additionally times N back-to-back requests (the same photo and question) two ways: one generate() after another, and generate_many() with the
 // next image's preprocessing + Neural Engine work overlapping the GPU decoding of the current answer. Reports p50 / p99 of the total for each.
@@ -8,6 +10,7 @@
 // connector, prefill (prompt + image through the language model), time to first token (preprocess + vision + prefill + first sample), decode ms per
 // token. Exit codes: 0 ok, 1 failed, 2 usage error.
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -26,7 +29,7 @@ constexpr int kExitOk = 0, kExitFailed = 1, kExitUsage = 2;
 struct Options {
     std::string models, image, text, prompt = "Describe this image in one sentence.";
     VlmOptions vlm;
-    int max_tokens = 64, warmup = 3, iters = 20, stream = 0, decode_only = 0;
+    int max_tokens = 64, warmup = 3, iters = 20, stream = 0, decode_only = 0, device_sampling = 0, pause_ms = 0, spin_wait = 1;
 };
 
 Result<long> parse_int(const std::string & flag, const char * text, long lo, long hi) {
@@ -48,12 +51,17 @@ Result<Options> parse_args(int argc, char ** argv) {
         if (flag == "--text") { o.text = value; continue; }  // another language-model file (a quantized one) instead of DIR/text-f16.gguf
         if (flag == "--prompt") { o.prompt = value; continue; }
         if (flag == "--vision-units") { o.vlm.vision_units = value; continue; }
+        if (flag == "--text-engine") { o.vlm.text_engine = value; continue; }
         long lo = 0, hi = 100000;
         int * dst = nullptr;
         if (flag == "--max-tokens") { lo = 1; hi = 4096; dst = &o.max_tokens; }
         else if (flag == "--iters") { lo = 1; dst = &o.iters; }
         else if (flag == "--warmup") dst = &o.warmup;
         else if (flag == "--decode-only") { hi = 1; dst = &o.decode_only; }
+        else if (flag == "--spin-wait") { hi = 1; dst = &o.spin_wait; }
+        else if (flag == "--pause-ms") { hi = 10000; dst = &o.pause_ms; }
+        else if (flag == "--queue-depth") { lo = 1; hi = 64; dst = &o.vlm.metal_queue_depth; }
+        else if (flag == "--device-sampling") { hi = 1; dst = &o.device_sampling; }  // greedy token picked on the GPU (TextDecoderOptions::device_sampling)
         else if (flag == "--stream") { lo = 1; hi = 1000; dst = &o.stream; }
         else if (flag == "--threads") { hi = 1024; dst = &o.vlm.text.n_threads; }
         else return invalid_argument("unknown option '" + flag + "'");
@@ -62,6 +70,8 @@ Result<Options> parse_args(int argc, char ** argv) {
         *dst = static_cast<int>(v.value());
     }
     if (o.models.empty() || o.image.empty()) return invalid_argument("--models and --image are required");
+    o.vlm.text.device_sampling = o.device_sampling == 1;
+    o.vlm.metal_spin_wait = o.spin_wait == 1;
     return o;
 }
 
@@ -85,6 +95,7 @@ int main(int argc, char ** argv) {
         if (!st.is_ok()) { std::fprintf(stderr, "error: %s\n", st.to_string().c_str()); return kExitFailed; }
     }
     for (int i = 0; i < o.warmup + o.iters; i++) {
+        if (o.pause_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(o.pause_ms));
         VlmTimings tm;
         auto r = o.decode_only ? pipe.value().generate_from_embeddings(fixed_embeddings, o.prompt, o.max_tokens, nullptr, &tm)
                                : pipe.value().generate(image.value(), o.prompt, o.max_tokens, nullptr, &tm);

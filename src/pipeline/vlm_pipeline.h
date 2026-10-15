@@ -26,6 +26,12 @@ struct VlmPaths {
 struct VlmOptions {
     std::string vision_units = "cpu_ne";  // "all" | "cpu_gpu" | "cpu_ne" | "cpu"
     TextDecoderOptions text;
+    // Who runs the language model: "auto" (the engine's own Metal decoder when it can run the file, otherwise llama.cpp), "metal" (the own decoder,
+    // backend/metal/metal_llama_decoder.h: f16 llama-architecture files only; anything else is refused at create()), or "llama.cpp". With the own decoder,
+    // llama.cpp still provides the vocabulary (tokenizing, token text). text_engine_used() says which one runs.
+    std::string text_engine = "auto";
+    bool metal_spin_wait = true;     // LlamaDecoderConfig::spin_wait
+    int32_t metal_queue_depth = 1;   // decode steps the Metal decoder keeps queued ahead of the token being read (>= 1)
 };
 
 struct VlmTimings {
@@ -60,6 +66,7 @@ public:
     ~VlmPipeline();
 
     int64_t n_image_tokens() const;
+    const char * text_engine_used() const;   // "metal" or "llama.cpp"
     int64_t embedding_dim() const;
     const VlmImageOptions & image_options() const;
 

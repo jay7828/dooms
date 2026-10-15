@@ -140,6 +140,55 @@ TEST(photo_to_answer_matches_transformers) {
     }
 }
 
+// text_engine: "auto" runs the own Metal decoder on the f16 file and falls back to llama.cpp for a quantized one; "metal" refuses what it cannot run;
+// both engines answer the reference photo with transformers' first tokens.
+TEST(text_engine_selection_and_fallback) {
+    const std::string dir = vlm_dir();
+    if (dir.empty()) { std::printf("        (skipped: set DOOMS_VLM_DIR)\n"); return; }
+    const VlmPaths f16{dir + "/vision-fp16.mlpackage", dir + "/text-f16.gguf", dir + "/vlm-config.gguf"};
+    VlmOptions o;
+    o.text_engine = "bogus";
+    EXPECT(VlmPipeline::create(f16, o).status().code() == Code::InvalidArgument);
+    o.text_engine = "metal";
+    o.metal_queue_depth = 0;
+    EXPECT(VlmPipeline::create(f16, o).status().code() == Code::InvalidArgument);
+    auto ref = GgufFile::open(dir + "/reference.gguf");
+    EXPECT(ref.is_ok());
+    if (!ref.is_ok()) return;
+    const Tensor photo = get(ref.value(), "case0.photo"), generated = get(ref.value(), "case0.generated");
+    RgbImage img;
+    img.height = photo.shape.dim(0);
+    img.width = photo.shape.dim(1);
+    for (float x : photo.data) img.pixels.push_back(static_cast<uint8_t>(x));
+    const std::string prompt = ref.value().get_string("case0.prompt").value();
+    for (const char * engine : {"auto", "metal", "llama.cpp"}) {
+        VlmOptions eo;
+        eo.text_engine = engine;
+        auto pipe = VlmPipeline::create(f16, eo);
+        EXPECT(pipe.is_ok());
+        if (!pipe.is_ok()) continue;
+        EXPECT_EQ(std::string(pipe.value().text_engine_used()), std::string(std::string(engine) == "llama.cpp" ? "llama.cpp" : "metal"));
+        auto out = pipe.value().generate(img, prompt, 32);
+        EXPECT(out.is_ok());
+        if (!out.is_ok()) continue;
+        size_t agree = 0;
+        while (agree < out.value().tokens.size() && agree < generated.data.size() && out.value().tokens[agree] == static_cast<int32_t>(generated.data[agree])) agree++;
+        std::printf("        %s (%s): %zu of %zu tokens equal transformers\n", engine, pipe.value().text_engine_used(), agree, generated.data.size());
+        EXPECT(agree >= 3);
+    }
+    const std::string q = dir + "/text-Q4_K_M.gguf";
+    if (FILE * fp = std::fopen(q.c_str(), "rb")) {
+        std::fclose(fp);
+        const VlmPaths quant{f16.vision, q, f16.config};
+        auto pipe = VlmPipeline::create(quant);
+        EXPECT(pipe.is_ok());
+        if (pipe.is_ok()) EXPECT_EQ(std::string(pipe.value().text_engine_used()), std::string("llama.cpp"));
+        VlmOptions mo;
+        mo.text_engine = "metal";
+        EXPECT(VlmPipeline::create(quant, mo).status().code() == Code::Unsupported);
+    }
+}
+
 TEST(generate_many_equals_generate_one_by_one) {
     const std::string dir = vlm_dir();
     if (dir.empty()) { std::printf("        (skipped: set DOOMS_VLM_DIR)\n"); return; }
