@@ -1,7 +1,7 @@
 build*/
 .venv*/
 dist/
-models/
+/models/
 *.gguf
 *.mlpackage
 __pycache__/
