@@ -15,6 +15,7 @@
 
 #include "pipeline/rgb_image.h"
 #include "pipeline/vla_chunk_runner.h"
+#include "pipeline/whisper_pipeline.h"
 #ifdef DOOMS_WITH_LLAMA
 #include "models/vlm/tokenizer.h"
 #include "pipeline/vla_pipeline.h"
@@ -76,6 +77,15 @@ dooms_code to_rgb_image(const dooms_image * in, const char * what, dooms::RgbIma
     out->width = in->width;
     out->height = in->height;
     out->pixels.assign(in->rgb, in->rgb + static_cast<size_t>(in->width) * static_cast<size_t>(in->height) * 3);
+    return DOOMS_OK;
+}
+
+// A NUL-terminated copy of `text` into a caller's buffer; *needed (optional) gets the size it takes. Too small: nothing written, DOOMS_RESOURCE_EXHAUSTED.
+dooms_code write_text(const std::string & text, char * out, size_t capacity, size_t * needed) {
+    if (needed) *needed = text.size() + 1;
+    if (!out && capacity > 0) return fail(DOOMS_INVALID_ARGUMENT, "out is NULL");
+    if (capacity < text.size() + 1) return fail(DOOMS_RESOURCE_EXHAUSTED, "the output buffer holds " + std::to_string(capacity) + " bytes, " + std::to_string(text.size() + 1) + " are needed");
+    std::memcpy(out, text.c_str(), text.size() + 1);
     return DOOMS_OK;
 }
 
@@ -300,13 +310,7 @@ dooms_code llm_run(dooms_llm * llm, F && call, std::string * text) {
     return DOOMS_OK;
 }
 
-dooms_code llm_write(const std::string & text, char * out, size_t capacity, size_t * needed) {
-    if (needed) *needed = text.size() + 1;
-    if (!out && capacity > 0) return fail(DOOMS_INVALID_ARGUMENT, "out is NULL");
-    if (capacity < text.size() + 1) return fail(DOOMS_RESOURCE_EXHAUSTED, "the output buffer holds " + std::to_string(capacity) + " bytes, " + std::to_string(text.size() + 1) + " are needed");
-    std::memcpy(out, text.c_str(), text.size() + 1);
-    return DOOMS_OK;
-}
+dooms_code llm_write(const std::string & text, char * out, size_t capacity, size_t * needed) { return write_text(text, out, capacity, needed); }
 
 }  // namespace
 #endif
@@ -750,6 +754,109 @@ DOOMS_API dooms_code dooms_vla_runner_stats_get(dooms_vla_runner * runner, dooms
 #else
         return fail(DOOMS_UNSUPPORTED, "this build of dooms.cpp was made without llama.cpp (DOOMS_WITH_LLAMA=OFF)");
 #endif
+    });
+}
+
+}  // extern "C"
+
+// ------------------------------------------------------------------------------------------------ speech to text (Whisper)
+struct dooms_whisper {
+    std::unique_ptr<dooms::WhisperPipeline> pipeline;
+    std::string text;            // last successful transcription
+    bool has_text = false;
+    dooms::WhisperTimings timings;
+};
+
+namespace {
+
+// Runs one transcription, keeps its text and timings in the handle, writes the text.
+template <class F>
+dooms_code whisper_run(dooms_whisper * w, F && call, char * out, size_t capacity, size_t * needed) {
+    dooms::WhisperTimings tm;
+    auto r = call(&tm);
+    if (!r.is_ok()) return from_status(r.status());
+    w->text = std::move(r.value().text);
+    w->has_text = true;
+    w->timings = tm;
+    return write_text(w->text, out, capacity, needed);
+}
+
+}  // namespace
+
+extern "C" {
+
+DOOMS_API dooms_code dooms_whisper_open(const dooms_whisper_paths * paths, const dooms_whisper_options * options, dooms_whisper ** out) {
+    return guarded([&]() -> dooms_code {
+        dooms_code c;
+        if (!out) return fail(DOOMS_INVALID_ARGUMENT, "out is NULL");
+        *out = nullptr;
+        if (!struct_ok(paths, "paths", &c)) return c;
+        if (!paths->encoder || !*paths->encoder || !paths->decoder || !*paths->decoder) return fail(DOOMS_INVALID_ARGUMENT, "paths.encoder and paths.decoder are required");
+        dooms::WhisperOptions o;
+        if (options) {
+            if (!struct_ok(options, "options", &c)) return c;
+            o.encoder_units = or_default(options->units, o.encoder_units.c_str());
+            o.language = or_default(options->language, o.language.c_str());
+            o.task = or_default(options->task, o.task.c_str());
+            if (options->max_tokens < 0) return fail(DOOMS_INVALID_ARGUMENT, "options.max_tokens is negative");
+            if (options->max_tokens > 0) o.max_tokens_per_window = options->max_tokens;
+        }
+        auto p = dooms::WhisperPipeline::create({paths->encoder, paths->decoder}, o);
+        if (!p.is_ok()) return from_status(p.status());
+        auto h = std::make_unique<dooms_whisper>();
+        h->pipeline = std::make_unique<dooms::WhisperPipeline>(std::move(p).value());
+        *out = h.release();
+        return DOOMS_OK;
+    });
+}
+
+DOOMS_API void dooms_whisper_close(dooms_whisper * whisper) { delete whisper; }
+
+DOOMS_API int32_t dooms_whisper_sample_rate(const dooms_whisper * whisper) { return whisper && whisper->pipeline ? whisper->pipeline->sample_rate() : 0; }
+
+DOOMS_API dooms_code dooms_whisper_transcribe(dooms_whisper * whisper, const float * samples, size_t n, char * out, size_t capacity, size_t * needed) {
+    return guarded([&]() -> dooms_code {
+        if (!whisper) return fail(DOOMS_INVALID_ARGUMENT, "whisper is NULL");
+        if (!samples || n == 0) return fail(DOOMS_INVALID_ARGUMENT, "no samples");
+        const std::vector<float> audio(samples, samples + n);
+        return whisper_run(whisper, [&](dooms::WhisperTimings * tm) { return whisper->pipeline->transcribe(audio, tm); }, out, capacity, needed);
+    });
+}
+
+DOOMS_API dooms_code dooms_whisper_transcribe_file(dooms_whisper * whisper, const char * path, char * out, size_t capacity, size_t * needed) {
+    return guarded([&]() -> dooms_code {
+        if (!whisper) return fail(DOOMS_INVALID_ARGUMENT, "whisper is NULL");
+        if (!path || !*path) return fail(DOOMS_INVALID_ARGUMENT, "path is NULL or empty");
+        return whisper_run(whisper, [&](dooms::WhisperTimings * tm) { return whisper->pipeline->transcribe_file(path, tm); }, out, capacity, needed);
+    });
+}
+
+DOOMS_API dooms_code dooms_whisper_last_text(const dooms_whisper * whisper, char * out, size_t capacity, size_t * needed) {
+    return guarded([&]() -> dooms_code {
+        if (!whisper) return fail(DOOMS_INVALID_ARGUMENT, "whisper is NULL");
+        if (!whisper->has_text) return fail(DOOMS_NOT_FOUND, "no transcription has finished on this handle");
+        return write_text(whisper->text, out, capacity, needed);
+    });
+}
+
+DOOMS_API dooms_code dooms_whisper_last_timings(const dooms_whisper * whisper, dooms_whisper_timings * out) {
+    return guarded([&]() -> dooms_code {
+        dooms_code c;
+        if (!whisper) return fail(DOOMS_INVALID_ARGUMENT, "whisper is NULL");
+        if (!struct_ok(out, "out", &c)) return c;
+        dooms_whisper_timings t{};
+        const dooms::WhisperTimings & s = whisper->timings;
+        t.features_ms = s.features_ms;
+        t.encoder_ms = s.encoder_ms;
+        t.decode_ms = s.decode_ms;
+        t.total_ms = s.total_ms;
+        t.audio_s = s.audio_s;
+        t.windows = static_cast<int32_t>(s.windows);
+        t.tokens = static_cast<int32_t>(s.tokens);
+        const size_t n = std::min(out->struct_size, sizeof(t));
+        t.struct_size = out->struct_size;
+        std::memcpy(out, &t, n);
+        return DOOMS_OK;
     });
 }
 

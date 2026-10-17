@@ -59,6 +59,51 @@ class Llm(unittest.TestCase):
                 llm.generate("hi", 8, on_text=lambda p: (_ for _ in ()).throw(RuntimeError("boom")))
 
 
+WHISPER_DIR = os.path.join(MODELS, "whisper", "whisper-tiny", "dooms")
+SPEECH = os.path.join(MODELS, "whisper", "data")   # bench/python/speech_testset.py
+
+
+def wav_samples(path):
+    import wave  # noqa: PLC0415
+    with wave.open(path) as w:
+        assert w.getnchannels() == 1 and w.getsampwidth() == 2 and w.getframerate() == 16000
+        return np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
+
+
+class Whisper(unittest.TestCase):
+    def test_arguments(self):
+        with self.assertRaises(ValueError):
+            dooms.Whisper()
+        with self.assertRaises(dooms.DoomsError) as cm:
+            dooms.Whisper("/nonexistent")
+        self.assertEqual(cm.exception.code, "NotFound")
+
+    @unittest.skipUnless(os.path.exists(os.path.join(WHISPER_DIR, "decoder.gguf")) and os.path.exists(os.path.join(SPEECH, "long.wav")),
+                         "whisper-tiny (tools/convert/convert_whisper.py) and the speech clips (bench/python/speech_testset.py) not available")
+    def test_transcribe_file_and_samples(self):
+        with dooms.Whisper(WHISPER_DIR) as stt:
+            self.assertEqual(stt.sample_rate, 16000)
+            clip = os.path.join(SPEECH, "1272-128104-0000.wav")
+            text = stt.transcribe(clip)
+            self.assertIn("Quilter is the apostle of the middle classes", text)
+            t = stt.last_timings
+            self.assertEqual(t.windows, 1)
+            self.assertGreater(t.tokens, 10)
+            self.assertAlmostEqual(t.rtf, t.total_ms / 1000 / t.audio_s)
+            self.assertEqual(stt.transcribe(wav_samples(clip)), text)            # the same samples through the array path
+            long_text = stt.transcribe(os.path.join(SPEECH, "long.wav"))         # 8 minutes: more text than the first buffer holds
+            self.assertGreater(len(long_text.encode()), 4096)
+            self.assertEqual(stt.last_timings.windows, 17)
+            with self.assertRaises(ValueError):
+                stt.transcribe(np.zeros((2, 100), np.float32))
+            with self.assertRaises(dooms.DoomsError) as cm:
+                stt.transcribe("/nonexistent.wav")
+            self.assertEqual(cm.exception.code, "NotFound")
+        with self.assertRaises(dooms.DoomsError) as cm:
+            dooms.Whisper(WHISPER_DIR, language="xx")
+        self.assertEqual(cm.exception.code, "InvalidArgument")
+
+
 class ErrorPaths(unittest.TestCase):
     def test_version(self):
         self.assertRegex(dooms.version(), r"^\d+\.\d+\.\d+$")

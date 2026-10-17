@@ -1,7 +1,7 @@
 """The `dooms` command (also `python -m dooms`).
 
     dooms serve --model FILE.gguf [--host 127.0.0.1] [--port 8080] [--n-ctx N] [--model-name NAME]
-    dooms pull NAME [--dir DIR]          NAME: an alias (dooms pull --help), hf:OWNER/REPO/FILE.gguf[@REVISION], smolvlm or smolvla
+    dooms pull NAME [--dir DIR]          NAME: an alias (dooms pull --help), hf:OWNER/REPO/FILE.gguf[@REVISION], smolvlm, smolvla or whisper-*
     dooms list [--dir DIR]
 
 Exit codes: 0 success, 1 the command failed (message on stderr), 2 usage error.
@@ -108,9 +108,9 @@ def _parser() -> argparse.ArgumentParser:
     aliases = "; ".join(f"{k}: {a.note} ({a.repo})" for k, a in pull.ALIASES.items())
     default_dir = f"${pull.MODELS_ENV}, else {pull.DEFAULT_MODELS_DIR}"
     d = sub.add_parser("pull", help="download a model from Hugging Face and verify it",
-                       description=f"Downloads a GGUF and checks it against Hugging Face's published hash (resumable). Aliases: {aliases}. smolvlm and smolvla download "
-                                   "the original weights and convert them locally (source checkout with the converter environment only).")
-    d.add_argument("name", help="an alias, hf:OWNER/REPO/FILE.gguf[@REVISION], smolvlm or smolvla")
+                       description=f"Downloads a GGUF and checks it against Hugging Face's published hash (resumable). Aliases: {aliases}. smolvlm, smolvla, whisper-tiny and "
+                                   "whisper-large-v3-turbo download the original weights and convert them locally (source checkout with the converter environment only).")
+    d.add_argument("name", help="an alias, hf:OWNER/REPO/FILE.gguf[@REVISION], smolvlm, smolvla or whisper-*")
     d.add_argument("--dir", default=None, help=f"models directory (default {default_dir})")
     d.set_defaults(func=_pull)
     li = sub.add_parser("list", help="show what is in the models directory")

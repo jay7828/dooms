@@ -176,4 +176,58 @@ private:
     dooms_vlm * h_ = nullptr;
 };
 
+// Speech to text (Whisper): encoder on Core ML, the engine's own Metal decoder. `model_dir` holds encoder-fp16.mlpackage and decoder.gguf
+// (tools/convert/convert_whisper.py). Empty strings take the C API's defaults (GPU encoder, "en", "transcribe").
+class Whisper {
+public:
+    explicit Whisper(const std::string & model_dir, const std::string & language = "", const std::string & task = "", const std::string & units = "") {
+        const std::string enc = model_dir + "/encoder-fp16.mlpackage", dec = model_dir + "/decoder.gguf";
+        dooms_whisper_paths p{sizeof(dooms_whisper_paths), enc.c_str(), dec.c_str()};
+        dooms_whisper_options o{sizeof(dooms_whisper_options), units.empty() ? nullptr : units.c_str(), language.empty() ? nullptr : language.c_str(),
+                                task.empty() ? nullptr : task.c_str(), 0};
+        detail::check(dooms_whisper_open(&p, &o, &h_));
+    }
+    Whisper(Whisper && o) noexcept : h_(std::exchange(o.h_, nullptr)) {}
+    Whisper & operator=(Whisper && o) noexcept {
+        if (this != &o) { dooms_whisper_close(h_); h_ = std::exchange(o.h_, nullptr); }
+        return *this;
+    }
+    Whisper(const Whisper &) = delete;
+    Whisper & operator=(const Whisper &) = delete;
+    ~Whisper() { dooms_whisper_close(h_); }
+
+    int32_t sample_rate() const { return dooms_whisper_sample_rate(h_); }
+    // Any audio file Core Audio decodes.
+    std::string transcribe_file(const std::string & path) {
+        return fetch([&](char * out, size_t cap, size_t * need) { return dooms_whisper_transcribe_file(h_, path.c_str(), out, cap, need); });
+    }
+    // Mono samples in [-1, 1] at sample_rate().
+    std::string transcribe(const std::vector<float> & samples) {
+        return fetch([&](char * out, size_t cap, size_t * need) { return dooms_whisper_transcribe(h_, samples.data(), samples.size(), out, cap, need); });
+    }
+    dooms_whisper_timings last_timings() const {
+        dooms_whisper_timings t{};
+        t.struct_size = sizeof t;
+        detail::check(dooms_whisper_last_timings(h_, &t));
+        return t;
+    }
+
+private:
+    // A text that did not fit stays in the handle: fetch it with dooms_whisper_last_text instead of transcribing again.
+    template <class F> std::string fetch(F call) {
+        size_t cap = 4096, need = 0;
+        std::string buf(cap, '\0');
+        dooms_code c = call(&buf[0], cap, &need);
+        if (c == DOOMS_RESOURCE_EXHAUSTED && need > cap) {
+            buf.assign(need, '\0');
+            c = dooms_whisper_last_text(h_, &buf[0], need, nullptr);
+        }
+        detail::check(c);
+        buf.resize(std::char_traits<char>::length(buf.c_str()));
+        return buf;
+    }
+
+    dooms_whisper * h_ = nullptr;
+};
+
 }  // namespace dooms

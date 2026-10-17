@@ -45,9 +45,9 @@ constexpr uint32_t kFlagNorm = 1, kFlagAccumulate = 2, kFlagBias = 4;  // Matvec
 struct MatvecParams { uint32_t K, N, flags; float eps; };
 struct GemmParams { uint32_t K, N, M, x_stride, y_stride, flags; float eps; };
 struct AttnParams { uint32_t n_head, n_head_kv, head_dim, qkv_stride, kv_stride, out_stride, p0, fused_rope, neox; float scale, base; };
-struct EmbedParams { uint32_t n_embd, token_index; };
-struct ArgmaxParams { uint32_t n, out_index; };
-static_assert(sizeof(MatvecParams) == 16 && sizeof(GemmParams) == 28 && sizeof(AttnParams) == 44 && sizeof(EmbedParams) == 8 && sizeof(ArgmaxParams) == 8,
+struct EmbedParams { uint32_t n_embd, token_index, pos, use_pos; };
+struct ArgmaxParams { uint32_t n, out_index, use_mask; };
+static_assert(sizeof(MatvecParams) == 16 && sizeof(GemmParams) == 28 && sizeof(AttnParams) == 44 && sizeof(EmbedParams) == 16 && sizeof(ArgmaxParams) == 12,
               "parameter structs must match the kernel source field for field");
 
 std::string describe(NSError * e) { return e ? std::string([[e localizedDescription] UTF8String]) : std::string("unknown error"); }
@@ -120,6 +120,7 @@ struct MetalLlamaDecoder::Impl {
         [enc setBuffer:weights offset:gamma atIndex:3];
         [enc setBytes:&p length:sizeof p atIndex:4];
         [enc setBuffer:weights offset:bias atIndex:5];
+        [enc setBuffer:weights offset:0 atIndex:6];   // LayerNorm beta: unused (no LayerNorm flag) but bound
         [enc setThreadgroupMemoryLength:align_up(static_cast<size_t>(stage ? K : 4) * sizeof(float), 16) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake((N + kDecodeRowsPerGroup - 1) / kDecodeRowsPerGroup, 1, 1) threadsPerThreadgroup:MTLSizeMake(kGroupThreads, 1, 1)];
         after_dispatch(kind);
@@ -246,23 +247,25 @@ struct MetalLlamaDecoder::Impl {
         const uint32_t V = static_cast<uint32_t>(cfg.n_vocab);
         matvec1(enc0, "output", output, x, static_cast<size_t>(M - 1) * E * sizeof(float), logits_buf, output_norm, E, V, kFlagNorm);
         id<MTLComputeCommandEncoder> enc = enc_now(enc0);
-        ArgmaxParams ap{V, out_index};
+        ArgmaxParams ap{V, out_index, 0};
         [enc setComputePipelineState:p_argmax];
         [enc setBuffer:logits_buf offset:0 atIndex:0];
         [enc setBuffer:tokens offset:0 atIndex:1];
         [enc setBytes:&ap length:sizeof ap atIndex:2];
+        [enc setBuffer:logits_buf offset:0 atIndex:3];   // mask: unused (use_mask 0) but bound
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(argmax_threads, 1, 1)];
         after_dispatch("argmax");
     }
 
     void encode_embed(id<MTLComputeCommandEncoder> enc0, id<MTLBuffer> ids, uint32_t first, uint32_t rows) {
         id<MTLComputeCommandEncoder> enc = enc_now(enc0);
-        EmbedParams ep{static_cast<uint32_t>(cfg.n_embd), first};
+        EmbedParams ep{static_cast<uint32_t>(cfg.n_embd), first, 0, 0};
         [enc setComputePipelineState:p_embed];
         [enc setBuffer:weights offset:token_embd atIndex:0];
         [enc setBuffer:ids offset:0 atIndex:1];
         [enc setBuffer:x offset:0 atIndex:2];
         [enc setBytes:&ep length:sizeof ep atIndex:3];
+        [enc setBuffer:weights offset:0 atIndex:4];   // position table: unused (use_pos 0) but bound
         [enc dispatchThreadgroups:MTLSizeMake((static_cast<uint32_t>(cfg.n_embd) + kEmbedThreads - 1) / kEmbedThreads, rows, 1)
              threadsPerThreadgroup:MTLSizeMake(kEmbedThreads, 1, 1)];
         after_dispatch("embed");

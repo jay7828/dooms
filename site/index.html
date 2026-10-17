@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>dooms.cpp</title>
-  <meta name="description" content="An inference engine for Apple Silicon: language, vision-language and robot-action models on the GPU and the Neural Engine, with every number measured.">
+  <meta name="description" content="An inference engine for Apple Silicon: language, vision-language, speech and robot-action models on the GPU and the Neural Engine, with every number measured.">
   <meta property="og:title" content="dooms.cpp">
-  <meta property="og:description" content="Language, vision-language and robot-action models on Apple Silicon, measured against PyTorch, MLX and llama.cpp.">
+  <meta property="og:description" content="Language, vision-language, speech and robot-action models on Apple Silicon, measured against PyTorch, MLX, llama.cpp and whisper.cpp.">
   <link rel="preload" href="fonts/geist-400.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="preload" href="fonts/geist-600.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
@@ -84,6 +84,7 @@
         <button role="tab" aria-selected="true" data-tab="vla">SmolVLA</button>
         <button role="tab" aria-selected="false" data-tab="vlm">SmolVLM</button>
         <button role="tab" aria-selected="false" data-tab="llm">LLM</button>
+        <button role="tab" aria-selected="false" data-tab="speech">Speech</button>
         <button role="tab" aria-selected="false" data-tab="vit">ViT on the GPU</button>
       </div>
       <div class="bench-body">
@@ -154,7 +155,7 @@ for piece in llm.stream("Once upon a time", 200, temperature=0.8, seed=1):
 
 vla = dooms.VLA.from_dir("models/smolvla")
 actions = vla.infer([cam1, cam2, cam3], "pick up the red cube", state)</code></pre>
-<pre data-code="cpp" hidden><code><span class="c">// find_package(dooms 0.3 REQUIRED)  target_link_libraries(app PRIVATE dooms::dooms)</span>
+<pre data-code="cpp" hidden><code><span class="c">// find_package(dooms 0.4 REQUIRED)  target_link_libraries(app PRIVATE dooms::dooms)</span>
 #include &lt;dooms/dooms.hpp&gt;
 
 dooms::Llm llm("qwen2.5-0.5b-instruct-q4_k_m.gguf");

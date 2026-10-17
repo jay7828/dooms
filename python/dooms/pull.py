@@ -2,7 +2,7 @@
 
     dooms pull qwen2.5-0.5b                                   # an alias of ALIASES: a GGUF from its publisher's own repository, pinned to a commit
     dooms pull hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf[@REVISION]
-    dooms pull smolvlm | smolvla                              # original weights + local conversion (source checkout only, see CONVERTED)
+    dooms pull smolvlm | smolvla | whisper-tiny | whisper-large-v3-turbo   # original weights + local conversion (source checkout only, see CONVERTED)
 
 Every file is checked against the hash Hugging Face publishes for it (the SHA-256 of an LFS file, `lfs.oid` in the paths-info API; the git blob SHA-1 of a small
 file, `oid`). Downloads go to `<file>.part`, resume with an HTTP Range request, and are renamed into place only after the check; a mismatch deletes the partial file.
@@ -72,7 +72,14 @@ class Snapshot:
 SMOLVLM = Snapshot("HuggingFaceTB/SmolVLM-256M-Instruct", "7e3e67edbbed1bf9888184d9df282b700a323964", ("onnx/",))
 SMOLVLA_VLM = Snapshot("HuggingFaceTB/SmolVLM2-500M-Video-Instruct", "7b375e1b73b11138ff12fe22c8f2822d8fe03467", ("onnx/",))
 SMOLVLA_POLICY = Snapshot("lerobot/smolvla_base", "5e8d12a6e2975b0e5e5fce7c8caf47c371d257b6", ("Finetune_SmolVLA_notebook.ipynb", "collage_small.gif"))
-CONVERTED = ("smolvlm", "smolvla")
+# Whisper (MIT): the snapshot, and the encoder check's limit (convert_whisper.py --encoder-max-rel-l2; large-v3-turbo's 32 fp16 layers measure 2.28e-2 on random features,
+# its real-speech parity is in tests/unit/test_whisper.cpp). Other framework exports in the repository are not read.
+_WHISPER_SKIP = ("flax_model.msgpack", "tf_model.h5", "pytorch_model.bin")
+WHISPER: Dict[str, Tuple[Snapshot, float]] = {
+    "whisper-tiny": (Snapshot("openai/whisper-tiny", "169d4a4341b33bc18d8881c4b69c2e104e1cc0af", _WHISPER_SKIP), 2e-2),
+    "whisper-large-v3-turbo": (Snapshot("openai/whisper-large-v3-turbo", "41f01f3fe87f28c78e2fbf8b568835947dd65ed9", _WHISPER_SKIP), 3e-2),
+}
+CONVERTED = ("smolvlm", "smolvla") + tuple(WHISPER)
 CONVERT_MODULES = ("torch", "coremltools", "transformers", "gguf", "safetensors", "huggingface_hub")   # what tools/convert imports
 LEROBOT_MODULES = ("torch", "lerobot")                                                                  # tools/parity/smolvla_reference.py
 
@@ -369,7 +376,7 @@ def pull_snapshot(s: Snapshot, target_dir: str, progress: Optional[Progress] = s
     return dest_dir
 
 
-# ------------------------------------------------------------------------------------------------ local conversion (smolvlm, smolvla)
+# ------------------------------------------------------------------------------------------------ local conversion (smolvlm, smolvla, whisper-*)
 
 def source_dir() -> Optional[str]:
     """The dooms.cpp checkout this package runs from (or $DOOMS_SOURCE_DIR), if it has the converters."""
@@ -420,7 +427,11 @@ def _check_loads(name: str, out_dir: str) -> None:
 
     import dooms  # noqa: PLC0415
 
-    if name == "smolvlm":
+    if name in WHISPER:
+        with dooms.Whisper(out_dir) as stt:
+            text = stt.transcribe(np.zeros(stt.sample_rate, dtype=np.float32))
+        print(f"{out_dir}: loads and transcribes one second of silence ({text!r})", file=sys.stderr)
+    elif name == "smolvlm":
         with dooms.VLM.from_dir(out_dir) as vlm:
             text = vlm.generate(np.full((64, 64, 3), 128, dtype=np.uint8), "What colour is this image?", max_new_tokens=4)
         print(f"{out_dir}: loads and answers ({text!r})", file=sys.stderr)
@@ -435,7 +446,7 @@ def pull_converted(name: str, target_dir: str, progress: Optional[Progress] = st
     if root is None:
         raise _how_to_convert(name, "this installation has no converters (tools/convert is part of the source checkout, not of the wheel)")
     convert_py = _python_with("DOOMS_CONVERT_PYTHON", os.path.join(root, ".venv", "bin", "python"), CONVERT_MODULES, name, "the converters")
-    llama_cpp = _llama_cpp_dir(root, name)
+    llama_cpp = None if name in WHISPER else _llama_cpp_dir(root, name)
     lerobot_py = None
     if name == "smolvla":
         lerobot_py = _python_with("DOOMS_LEROBOT_PYTHON", os.path.join(root, ".venv-lerobot", "bin", "python"), LEROBOT_MODULES, name, "the LeRobot reference")
@@ -443,7 +454,11 @@ def pull_converted(name: str, target_dir: str, progress: Optional[Progress] = st
     tmp = out + ".converting"
     os.makedirs(tmp, exist_ok=True)
     conv = lambda script: os.path.join(root, "tools", "convert", script)  # noqa: E731
-    if name == "smolvlm":
+    if name in WHISPER:
+        snapshot, max_rel_l2 = WHISPER[name]
+        model = pull_snapshot(snapshot, target_dir, progress)
+        _run([convert_py, conv("convert_whisper.py"), "--model", model, "--out-dir", tmp, "--encoder-max-rel-l2", str(max_rel_l2)], root)
+    elif name == "smolvlm":
         vlm = pull_snapshot(SMOLVLM, target_dir, progress)
         _run([convert_py, conv("convert_smolvlm.py"), "--model", vlm, "--out-dir", tmp, "--llama-cpp", llama_cpp], root)
     else:
@@ -465,12 +480,13 @@ def pull_converted(name: str, target_dir: str, progress: Optional[Progress] = st
         print(f"the previous {out} was kept as {backup}", file=sys.stderr)
     else:
         os.replace(tmp, out)
-    print(f"{out}: converted and verified (open it with dooms.{'VLM' if name == 'smolvlm' else 'VLA'}.from_dir)", file=sys.stderr)
+    opener = "dooms.Whisper" if name in WHISPER else f"dooms.{'VLM' if name == 'smolvlm' else 'VLA'}.from_dir"
+    print(f"{out}: converted and verified (open it with {opener})", file=sys.stderr)
     return out
 
 
 def pull(name: str, target_dir: Optional[str] = None, progress: Optional[Progress] = stderr_progress) -> str:
-    """Downloads (and, for smolvlm / smolvla, converts) `name`; returns the path of the model file or directory."""
+    """Downloads (and, for the CONVERTED models, converts) `name`; returns the path of the model file or directory."""
     d = models_dir(target_dir)
     if name.startswith("hf:"):
         repo, path, revision = parse_hf(name)

@@ -73,6 +73,19 @@ class VlaInfo(ctypes.Structure):
     _fields_ = [("n_cameras", c_int32), ("chunk_size", c_int32), ("action_dim", c_int32), ("state_dim", c_int32), ("max_task_tokens", c_int32)]
 
 
+class WhisperPaths(ctypes.Structure):
+    _fields_ = [("struct_size", c_size_t), ("encoder", c_char_p), ("decoder", c_char_p)]
+
+
+class WhisperOptions(ctypes.Structure):
+    _fields_ = [("struct_size", c_size_t), ("units", c_char_p), ("language", c_char_p), ("task", c_char_p), ("max_tokens", c_int32)]
+
+
+class WhisperTimings(ctypes.Structure):
+    _fields_ = [("struct_size", c_size_t), ("features_ms", c_double), ("encoder_ms", c_double), ("decode_ms", c_double), ("total_ms", c_double),
+                ("audio_s", c_double), ("windows", c_int32), ("tokens", c_int32)]
+
+
 def _candidates():
     env = os.environ.get("DOOMS_LIB")
     if env:
@@ -164,3 +177,18 @@ def _declare(lib):
     lib.dooms_vla_runner_wait_idle.argtypes = [c_void_p, c_double, POINTER(c_int32)]
     lib.dooms_vla_runner_stats_get.restype = code
     lib.dooms_vla_runner_stats_get.argtypes = [c_void_p, POINTER(VlaRunnerStats)]
+    # speech to text, appended to C API version 1 (Whisper._require)
+    if hasattr(lib, "dooms_whisper_open"):
+        lib.dooms_whisper_open.restype = code
+        lib.dooms_whisper_open.argtypes = [POINTER(WhisperPaths), POINTER(WhisperOptions), POINTER(c_void_p)]
+        lib.dooms_whisper_close.argtypes = [c_void_p]
+        lib.dooms_whisper_sample_rate.restype = c_int32
+        lib.dooms_whisper_sample_rate.argtypes = [c_void_p]
+        lib.dooms_whisper_transcribe.restype = code
+        lib.dooms_whisper_transcribe.argtypes = [c_void_p, POINTER(c_float), c_size_t, ctypes.c_char_p, c_size_t, POINTER(c_size_t)]
+        lib.dooms_whisper_transcribe_file.restype = code
+        lib.dooms_whisper_transcribe_file.argtypes = [c_void_p, c_char_p, ctypes.c_char_p, c_size_t, POINTER(c_size_t)]
+        lib.dooms_whisper_last_text.restype = code
+        lib.dooms_whisper_last_text.argtypes = [c_void_p, ctypes.c_char_p, c_size_t, POINTER(c_size_t)]
+        lib.dooms_whisper_last_timings.restype = code
+        lib.dooms_whisper_last_timings.argtypes = [c_void_p, POINTER(WhisperTimings)]

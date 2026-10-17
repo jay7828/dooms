@@ -278,6 +278,66 @@ int main(void) {
         }
     }
 
+    /* speech to text: argument checks always; with DOOMS_WHISPER_DIR (converted model) and DOOMS_WHISPER_CLIP (a speech file) the real model (CTest c_api_whisper) */
+    {
+        dooms_whisper * w = (dooms_whisper *) 1;
+        dooms_whisper_paths wp;
+        dooms_whisper_options wo;
+        dooms_whisper_timings wt;
+        char small[4], text[4096];
+        size_t needed = 0;
+        float silence[16000];
+        CHECK(dooms_whisper_open(NULL, NULL, &w) == DOOMS_INVALID_ARGUMENT && w == NULL);
+        memset(&wp, 0, sizeof wp);
+        CHECK(dooms_whisper_open(&wp, NULL, &w) == DOOMS_INVALID_ARGUMENT); /* struct_size unset */
+        wp.struct_size = sizeof wp;
+        CHECK(dooms_whisper_open(&wp, NULL, &w) == DOOMS_INVALID_ARGUMENT); /* no paths */
+        wp.encoder = "/nonexistent/encoder-fp16.mlpackage";
+        wp.decoder = "/nonexistent/decoder.gguf";
+        CHECK(dooms_whisper_open(&wp, NULL, &w) == DOOMS_NOT_FOUND && w == NULL && strlen(dooms_last_error()) > 0);
+        CHECK(dooms_whisper_open(&wp, NULL, NULL) == DOOMS_INVALID_ARGUMENT);
+        CHECK(dooms_whisper_transcribe(NULL, silence, 16000, text, sizeof text, NULL) == DOOMS_INVALID_ARGUMENT);
+        CHECK(dooms_whisper_transcribe_file(NULL, "a.wav", text, sizeof text, NULL) == DOOMS_INVALID_ARGUMENT);
+        CHECK(dooms_whisper_last_text(NULL, text, sizeof text, NULL) == DOOMS_INVALID_ARGUMENT);
+        CHECK(dooms_whisper_sample_rate(NULL) == 0);
+        dooms_whisper_close(NULL);
+        if (getenv("DOOMS_WHISPER_DIR") && *getenv("DOOMS_WHISPER_DIR") && getenv("DOOMS_WHISPER_CLIP")) {
+            char enc[1024], dec[1024];
+            snprintf(enc, sizeof enc, "%s/encoder-fp16.mlpackage", getenv("DOOMS_WHISPER_DIR"));
+            snprintf(dec, sizeof dec, "%s/decoder.gguf", getenv("DOOMS_WHISPER_DIR"));
+            wp.encoder = enc;
+            wp.decoder = dec;
+            memset(&wo, 0, sizeof wo);
+            wo.struct_size = sizeof wo;
+            wo.language = "xx";
+            CHECK(dooms_whisper_open(&wp, &wo, &w) == DOOMS_INVALID_ARGUMENT); /* unknown language */
+            wo.language = NULL;
+            wo.max_tokens = -1;
+            CHECK(dooms_whisper_open(&wp, &wo, &w) == DOOMS_INVALID_ARGUMENT);
+            wo.max_tokens = 0;
+            CHECK(dooms_whisper_open(&wp, &wo, &w) == DOOMS_OK);
+            if (w) {
+                CHECK(dooms_whisper_sample_rate(w) == 16000);
+                CHECK(dooms_whisper_last_text(w, text, sizeof text, NULL) == DOOMS_NOT_FOUND);
+                CHECK(dooms_whisper_transcribe(w, NULL, 0, text, sizeof text, NULL) == DOOMS_INVALID_ARGUMENT);
+                CHECK(dooms_whisper_transcribe_file(w, "/nonexistent.wav", text, sizeof text, NULL) == DOOMS_NOT_FOUND);
+                /* too small a buffer: the needed size is reported and the text is kept for dooms_whisper_last_text */
+                CHECK(dooms_whisper_transcribe_file(w, getenv("DOOMS_WHISPER_CLIP"), small, sizeof small, &needed) == DOOMS_RESOURCE_EXHAUSTED);
+                CHECK(needed > sizeof small && needed < sizeof text);
+                CHECK(dooms_whisper_last_text(w, text, sizeof text, NULL) == DOOMS_OK && strlen(text) + 1 == needed);
+                memset(&wt, 0, sizeof wt);
+                wt.struct_size = sizeof wt;
+                CHECK(dooms_whisper_last_timings(w, &wt) == DOOMS_OK);
+                CHECK(wt.windows == 1 && wt.tokens > 0 && wt.audio_s > 1.0 && wt.total_ms > 0 && wt.encoder_ms > 0 && wt.decode_ms > 0);
+                printf("        whisper: \"%s\" (%d tokens, %.0f ms for %.1f s)\n", text, wt.tokens, wt.total_ms, wt.audio_s);
+                memset(silence, 0, sizeof silence);
+                CHECK(dooms_whisper_transcribe(w, silence, 16000, text, sizeof text, &needed) == DOOMS_OK && strlen(text) + 1 == needed);
+                CHECK(dooms_whisper_last_timings(w, &wt) == DOOMS_OK && wt.audio_s == 1.0);
+                dooms_whisper_close(w);
+            }
+        }
+    }
+
     /* the last error is per call: a successful call clears it */
     CHECK(dooms_c_api_version() == DOOMS_C_API_VERSION);
     printf("%s\n", failures ? "FAILED" : "c api: ok");

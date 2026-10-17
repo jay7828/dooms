@@ -1,4 +1,4 @@
-"""dooms.cpp from Python: image question answering (SmolVLM) and robot actions (SmolVLA) on Apple Silicon.
+"""dooms.cpp from Python: text models, image question answering (SmolVLM), robot actions (SmolVLA) and speech to text (Whisper) on Apple Silicon.
 
     import dooms
     llm = dooms.LLM("qwen2.5-0.5b-instruct-q4_k_m.gguf")          # any text GGUF llama.cpp loads
@@ -8,6 +8,8 @@
     vla = dooms.VLA.from_dir("models/smolvla")
     actions = vla.infer([cam1, cam2, cam3], "pick up the red cube", state)   # (chunk_size, action_dim) float32
     runner = vla.runner(control_hz=30)                # asynchronous chunks for a control loop: wants_observation / submit / next_action
+    stt = dooms.Whisper("models/whisper/whisper-large-v3-turbo/dooms")
+    print(stt.transcribe("speech.wav"))               # a file (WAV, MP3, M4A, FLAC, ...) or 16 kHz mono float samples
 
 Images are numpy arrays (or anything numpy can convert, e.g. a PIL image) of shape (height, width, 3), dtype uint8, RGB. Handles are not thread-safe; close() them
 (or use `with`) to release the models. The shared library is found through $DOOMS_LIB, next to this package, or in <repo>/build.
@@ -25,7 +27,7 @@ import numpy as np
 
 from . import _lib
 
-__all__ = ["DoomsError", "Generation", "LLM", "VLM", "VLA", "VLARunner", "RunnerStats", "aggregate_weight", "version"]
+__all__ = ["DoomsError", "Generation", "LLM", "VLM", "VLA", "VLARunner", "RunnerStats", "Whisper", "WhisperTimings", "aggregate_weight", "version"]
 
 _lib_handle = None
 
@@ -373,6 +375,83 @@ class LLM(_Handle):
     def stream_chat(self, messages, max_new_tokens: int = 128, **kwargs) -> Iterator[str]:
         self._require_open()
         return self._iterate(lambda cb: self.chat(messages, max_new_tokens, on_text=cb, **kwargs))
+
+
+@dataclass(frozen=True)
+class WhisperTimings:
+    """Wall time of the last transcription per stage (audio file decoding excluded) and its size. rtf = total time / audio duration (below 1: faster than real time)."""
+    features_ms: float
+    encoder_ms: float
+    decode_ms: float
+    total_ms: float
+    audio_s: float
+    windows: int
+    tokens: int
+
+    @property
+    def rtf(self) -> float:
+        return self.total_ms / 1000.0 / self.audio_s if self.audio_s > 0 else 0.0
+
+
+class Whisper(_Handle):
+    """Speech to text with Whisper: the encoder on Core ML, the engine's own Metal decoder; greedy, no timestamps, 30-second windows one after another.
+
+        stt = dooms.Whisper("models/whisper/whisper-large-v3-turbo/dooms")   # encoder-fp16.mlpackage + decoder.gguf from tools/convert/convert_whisper.py
+        stt.transcribe("speech.m4a")                        # any file Core Audio decodes, resampled to 16 kHz mono
+        stt.transcribe(samples)                             # 1-D float array in [-1, 1] at stt.sample_rate
+        stt.last_timings.rtf
+
+    units: the encoder's Core ML units ("cpu_gpu" by default, "cpu_ne", "all", "cpu"); language: a code the model knows ("en" default); task: "transcribe" or
+    "translate" (into English); max_tokens: text tokens per 30-s window (0: 224)."""
+    _close = "dooms_whisper_close"
+
+    def __init__(self, model_dir=None, *, encoder=None, decoder=None, units: Optional[str] = None, language: Optional[str] = None, task: Optional[str] = None,
+                 max_tokens: int = 0):
+        super().__init__()
+        self._require("dooms_whisper_open")
+        if model_dir is not None:
+            encoder = encoder or os.path.join(model_dir, "encoder-fp16.mlpackage")
+            decoder = decoder or os.path.join(model_dir, "decoder.gguf")
+        if not encoder or not decoder:
+            raise ValueError("pass the model directory, or both encoder= and decoder=")
+        paths = _lib.WhisperPaths(ctypes.sizeof(_lib.WhisperPaths), _b(encoder), _b(decoder))
+        opts = _lib.WhisperOptions(ctypes.sizeof(_lib.WhisperOptions), _b(units), _b(language), _b(task), max_tokens)
+        _check(_library().dooms_whisper_open(ctypes.byref(paths), ctypes.byref(opts), ctypes.byref(self._h)))
+
+    _require = staticmethod(LLM._require)
+
+    @property
+    def sample_rate(self) -> int:
+        self._require_open()
+        return int(_library().dooms_whisper_sample_rate(self._h))
+
+    def transcribe(self, audio) -> str:
+        """`audio`: a path, or 1-D float samples in [-1, 1] at sample_rate (mono)."""
+        self._require_open()
+        lib = _library()
+        capacity = 4096
+        buf = ctypes.create_string_buffer(capacity)
+        needed = ctypes.c_size_t()
+        if isinstance(audio, (str, bytes, os.PathLike)):
+            code = lib.dooms_whisper_transcribe_file(self._h, os.fsencode(audio), buf, capacity, ctypes.byref(needed))
+        else:
+            a = np.ascontiguousarray(np.asarray(audio, dtype=np.float32))
+            if a.ndim != 1 or a.size == 0:
+                raise ValueError(f"expected 1-D mono samples, got shape {a.shape}")
+            code = lib.dooms_whisper_transcribe(self._h, a.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), a.size, buf, capacity, ctypes.byref(needed))
+        if code == 5 and needed.value > capacity:  # the text did not fit; the handle kept it, fetch it without transcribing again
+            capacity = needed.value
+            buf = ctypes.create_string_buffer(capacity)
+            code = lib.dooms_whisper_last_text(self._h, buf, capacity, None)
+        _check(code)
+        return buf.value.decode("utf-8", errors="replace")
+
+    @property
+    def last_timings(self) -> WhisperTimings:
+        self._require_open()
+        t = _lib.WhisperTimings(ctypes.sizeof(_lib.WhisperTimings))
+        _check(_library().dooms_whisper_last_timings(self._h, ctypes.byref(t)))
+        return WhisperTimings(t.features_ms, t.encoder_ms, t.decode_ms, t.total_ms, t.audio_s, int(t.windows), int(t.tokens))
 
 
 class VLA(_Handle):

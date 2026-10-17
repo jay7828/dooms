@@ -20,6 +20,10 @@ for piece in llm.stream_chat([{"role": "user", "content": "Tell a short story."}
 
 vlm = dooms.VLM.from_dir("models/smolvlm");  vlm.generate(rgb_array, "Describe this image.")
 vla = dooms.VLA.from_dir("models/smolvla");  vla.infer([cam1, cam2, cam3], "pick up the red cube", state)
+
+# Speech to text (Whisper; dooms pull whisper-large-v3-turbo, or tools/convert/convert_whisper.py)
+stt = dooms.Whisper("models/whisper-large-v3-turbo")
+print(stt.transcribe("meeting.m4a"), stt.last_timings.rtf)        # a file Core Audio decodes, or 16 kHz mono float samples
 ```
 
 `temperature=0` (default) is greedy and deterministic; above 0 tokens are drawn with a seeded generator (`seed`, `top_k`, `top_p`, `repeat_penalty`). `stop=[...]` ends the text before a
@@ -28,8 +32,8 @@ string. Each call is a fresh conversation. Errors raise `dooms.DoomsError` (`.co
 ## C++
 
 ```
-curl -LO https://github.com/jay7828/dooms/releases/download/v0.3.1/dooms-sdk-0.3.1-macos-arm64.tar.gz && tar xzf dooms-sdk-0.3.1-macos-arm64.tar.gz   # or scripts/package-sdk.sh
-cmake -S examples/cpp -B build -DCMAKE_PREFIX_PATH=$PWD/dooms-sdk-0.3.1-macos-arm64
+curl -LO https://github.com/jay7828/dooms/releases/download/v0.4.0/dooms-sdk-0.4.0-macos-arm64.tar.gz && tar xzf dooms-sdk-0.4.0-macos-arm64.tar.gz   # or scripts/package-sdk.sh
+cmake -S examples/cpp -B build -DCMAKE_PREFIX_PATH=$PWD/dooms-sdk-0.4.0-macos-arm64
 ```
 
 ```cpp
@@ -40,7 +44,7 @@ llm.generate("Once upon a time", 100, {0.8f, 40, 0.95f, 1.0f, /*seed*/ 1}, {"\n\
              [](const std::string & piece) { std::cout << piece << std::flush; return true; });   // return false to stop
 ```
 
-CMake: `find_package(dooms 0.3 REQUIRED)` then `target_link_libraries(app PRIVATE dooms::dooms)`. pkg-config: `dooms.pc`. Plain C: `dooms_c.h` (stable, append-only; `dooms_llm_*`,
+CMake: `find_package(dooms 0.4 REQUIRED)` then `target_link_libraries(app PRIVATE dooms::dooms)`. pkg-config: `dooms.pc`. Plain C: `dooms_c.h` (stable, append-only; `dooms_llm_*`,
 
 ## Command line
 
@@ -48,6 +52,7 @@ CMake: `find_package(dooms 0.3 REQUIRED)` then `target_link_libraries(app PRIVAT
 dooms-cli llm --model qwen2.5-0.5b-instruct-q4_k_m.gguf --prompt "Name three colours." --max-tokens 64 --stats
 dooms-cli llm --model model.gguf --raw --prompt "Once upon a time" --temp 0.8 --seed 1 --stop "\n\n"
 dooms-cli vlm --image photo.jpg --prompt "Describe this image." --models models/smolvlm
+dooms-cli transcribe --model ~/.cache/dooms/whisper-large-v3-turbo --audio speech.wav --stats
 ```
 
 ## OpenAI-compatible server
@@ -108,6 +113,8 @@ dooms list                                       # what is in the models directo
   `.venv` with torch, coremltools, transformers, gguf, safetensors, huggingface_hub (plus `.venv-lerobot` with LeRobot for SmolVLA); run
   `PYTHONPATH=python .venv/bin/python -m dooms pull smolvlm` there. Override with `DOOMS_SOURCE_DIR`, `DOOMS_CONVERT_PYTHON`, `DOOMS_LEROBOT_PYTHON`,
   `DOOMS_LLAMA_CPP_DIR`. From a wheel install it stops with these instructions.
+- `dooms pull whisper-tiny` / `dooms pull whisper-large-v3-turbo`: the same, from openai/whisper-tiny or openai/whisper-large-v3-turbo (MIT) into `<dir>/whisper-*`
+  (encoder-fp16.mlpackage + decoder.gguf; turbo's encoder conversion takes about 17 minutes). No llama.cpp needed.
 - By hand, any Hugging Face checkpoint llama.cpp supports:
 
 ```

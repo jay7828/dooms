@@ -1,10 +1,12 @@
 // dooms-cli: thin client of the model registry.
 //   dooms-cli list                      list models compiled into this build
 //   dooms-cli load <model> <path>       load a model file and report success
+//   dooms-cli transcribe --model DIR --audio F       speech to text (Whisper)
 // Exit codes: 0 success, 1 operation failed, 2 usage error.
 #include <cstdio>
 #include <cstring>
 
+#include "cli_transcribe.h"
 #include "core/log.h"
 #ifdef DOOMS_WITH_VLM
 #include "cli_llm.h"
@@ -19,7 +21,8 @@ constexpr int kExitOk = 0, kExitFailed = 1, kExitUsage = 2;
 
 int usage() {
     std::fprintf(stderr, "usage: dooms-cli list\n       dooms-cli load <model> <path>\n"
-                 "       dooms-cli llm --model F.gguf --prompt TEXT [options]\n       dooms-cli vlm --image F --prompt TEXT --models DIR [options]\n       dooms-cli vla --models DIR --prompt TEXT --camera F [--camera F ...] --state v1,v2,... [options]\n");
+                 "       dooms-cli llm --model F.gguf --prompt TEXT [options]\n       dooms-cli vlm --image F --prompt TEXT --models DIR [options]\n       dooms-cli vla --models DIR --prompt TEXT --camera F [--camera F ...] --state v1,v2,... [options]\n"
+                 "       dooms-cli transcribe --model DIR --audio FILE [options]\n");
     return kExitUsage;
 }
 
@@ -59,6 +62,8 @@ int main(int argc, char ** argv) {
         return kExitOk;
     }
 
+
+    if (!std::strcmp(argv[1], "transcribe")) return dooms::run_transcribe_command(argc - 1, argv + 1);
 
 #ifdef DOOMS_WITH_VLM
     if (!std::strcmp(argv[1], "llm")) return dooms::run_llm_command(argc - 1, argv + 1);

@@ -25,9 +25,42 @@ constant bool kStageInput [[function_constant(0)]];
 struct MatvecParams {
     uint K;         // input width (a multiple of 4)
     uint N;         // output rows
-    uint flags;     // bit 0: RMS-normalize the input with gamma first; bit 1: add into the output (residual) instead of overwriting it; bit 2: add bias[r]
+    uint flags;     // bit 0: RMS-normalize the input with gamma first; bit 1: add into the output (residual) instead of overwriting it; bit 2: add bias[r];
+                    // bit 3: LayerNorm the input instead (mean and variance, then gamma and beta; needs the staged input); bit 4: GELU (exact) on the output
     float eps;
 };
+
+// erf with a maximum absolute error of 1.5e-7 (Abramowitz and Stegun 7.1.26): the Metal standard library has none.
+static float erf_approx(float x) {
+    const float t = 1.f / (1.f + 0.3275911f * fabs(x));
+    const float y = 1.f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t * exp(-x * x);
+    return copysign(y, x);
+}
+
+static float gelu_erf(float x) { return 0.5f * x * (1.f + erf_approx(x * 0.70710678118654752f)); }
+
+// LayerNorm of x[0..K) by the whole threadgroup, staged into xs as (x - mean) / sqrt(var + eps) * gamma + beta (two passes: mean, then variance).
+static void stage_input_ln(device const float * x, device const float * gamma, device const float * beta, uint K, float eps, threadgroup float * xs,
+                           threadgroup float * red, uint tid, uint lane, uint sg) {
+    float s = 0.f;
+    for (uint k = tid; k < K; k += kGroupThreads) s += x[k];
+    s = simd_sum(s);
+    if (lane == 0) red[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = 0.f;
+    for (uint i = 0; i < kSimdgroupsPerGroup; i++) mean += red[i];
+    mean /= float(K);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float v = 0.f;
+    for (uint k = tid; k < K; k += kGroupThreads) { const float d = x[k] - mean; v += d * d; }
+    v = simd_sum(v);
+    if (lane == 0) red[sg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float var = 0.f;
+    for (uint i = 0; i < kSimdgroupsPerGroup; i++) var += red[i];
+    const float inv = rsqrt(var / float(K) + eps);
+    for (uint k = tid; k < K; k += kGroupThreads) xs[k] = (x[k] - mean) * inv * gamma[k] + beta[k];
+}
 
 // ---- One token (decode) ----
 
@@ -59,12 +92,15 @@ static float4 input4(threadgroup const float4 * xs4, device const float * x, dev
 // kDecodeRowsPerSimdgroup rows together, lanes striding the rows in half4 steps.
 kernel void matvec1(device const half * W [[buffer(0)]], device const float * x [[buffer(1)]], device float * y [[buffer(2)]],
                     device const float * gamma [[buffer(3)]], constant MatvecParams & p [[buffer(4)]], device const float * bias [[buffer(5)]],
-                    threadgroup float4 * xs4 [[threadgroup(0)]],
+                    device const float * beta [[buffer(6)]], threadgroup float4 * xs4 [[threadgroup(0)]],
                     uint gid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float red[kSimdgroupsPerGroup];
-    const bool norm = (p.flags & 1u) != 0, accumulate = (p.flags & 2u) != 0;
-    const float scale = stage_input(x, gamma, p.K, norm, p.eps, (threadgroup float *)xs4, red, tid, lane, sg);
+    const bool layernorm = (p.flags & 8u) != 0;
+    const bool norm = (p.flags & 1u) != 0 && !layernorm, accumulate = (p.flags & 2u) != 0;
+    float scale = 1.f;
+    if (layernorm) stage_input_ln(x, gamma, beta, p.K, p.eps, (threadgroup float *)xs4, red, tid, lane, sg);   // host guarantees kStageInput
+    else scale = stage_input(x, gamma, p.K, norm, p.eps, (threadgroup float *)xs4, red, tid, lane, sg);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint row0 = (gid * kSimdgroupsPerGroup + sg) * kDecodeRowsPerSimdgroup;
     if (row0 >= p.N) return;
@@ -79,7 +115,8 @@ kernel void matvec1(device const half * W [[buffer(0)]], device const float * x 
     }
     for (uint i = 0; i < kDecodeRowsPerSimdgroup; i++) {
         const uint r = row0 + i;
-        const float s = simd_sum(acc[i]) * scale + ((p.flags & 4u) && r < p.N ? bias[r] : 0.f);
+        float s = simd_sum(acc[i]) * scale + ((p.flags & 4u) && r < p.N ? bias[r] : 0.f);
+        if (p.flags & 16u) s = gelu_erf(s);
         if (lane == 0 && r < p.N) y[r] = accumulate ? y[r] + s : s;
     }
 }
@@ -421,16 +458,18 @@ struct AttnParams {
     uint out_stride;  // floats between tokens in the output
     uint p0;          // position of the first token
     uint fused_rope;  // 1: one token whose q, k, v are not rotated or cached yet (decode): rotate and cache them here; 0: rope_store ran (prefill)
-    uint neox;        // rotary pair layout: 0 adjacent (2i, 2i+1), llama.cpp's "normal"; 1 split halves (i, i + head_dim/2), "neox" (qwen2)
+    uint neox;        // rotary pair layout: 0 adjacent (2i, 2i+1), llama.cpp's "normal"; 1 split halves (i, i + head_dim/2), "neox" (qwen2);
+                      // 2 none (positions come from a learned table, as in Whisper)
     float scale;      // 1 / sqrt(head_dim)
     float base;       // rotary frequency base
 };
 
 // The two elements of rotary pair i in a head.
-static uint2 pair_index(uint i, uint hd, uint neox) { return neox ? uint2(i, i + hd / 2) : uint2(2 * i, 2 * i + 1); }
+static uint2 pair_index(uint i, uint hd, uint neox) { return neox == 1 ? uint2(i, i + hd / 2) : uint2(2 * i, 2 * i + 1); }
 
 // Rotates the adjacent pair i of a head for position pos by pos * base^(-2i / head_dim).
-static float2 rotate_pair(float2 v, uint i, uint hd, uint pos, float base) {
+static float2 rotate_pair(float2 v, uint i, uint hd, uint pos, float base, uint mode = 0) {
+    if (mode == 2) return v;
     const float theta = float(pos) * pow(base, -2.f * float(i) / float(hd));
     const float c = cos(theta), s = sin(theta);
     return float2(v.x * c - v.y * s, v.x * s + v.y * c);
@@ -485,13 +524,13 @@ kernel void attention(device const float * qkv [[buffer(0)]], device half * kc [
     for (uint i = tid; i < half_hd; i += kAttnThreads) {
         const uint2 e = pair_index(i, hd, p.neox);
         device const float * q = row + h * hd;
-        const float2 qr = fused ? rotate_pair(float2(q[e.x], q[e.y]), i, hd, n - 1, p.base) : float2(q[e.x], q[e.y]);
+        const float2 qr = fused ? rotate_pair(float2(q[e.x], q[e.y]), i, hd, n - 1, p.base, p.neox) : float2(q[e.x], q[e.y]);
         qs[e.x] = qr.x;
         qs[e.y] = qr.y;
         if (fused) {
             device const float * kx = row + (p.n_head + kvh) * hd;
             device const float * vx = row + (p.n_head + p.n_head_kv + kvh) * hd;
-            const half2 k = half2(rotate_pair(float2(kx[e.x], kx[e.y]), i, hd, n - 1, p.base));
+            const half2 k = half2(rotate_pair(float2(kx[e.x], kx[e.y]), i, hd, n - 1, p.base, p.neox));
             const half2 v = half2(vx[e.x], vx[e.y]);
             kn[e.x] = float(k.x); kn[e.y] = float(k.y);
             vn[e.x] = float(v.x); vn[e.y] = float(v.y);
@@ -674,22 +713,31 @@ template [[host_name("attention_prefill_64")]] kernel void attention_prefill<64>
 template [[host_name("attention_prefill_128")]] kernel void attention_prefill<128>(device const float *, device const half *, device const half *, device float *,
     constant AttnParams &, constant uint &, uint2, ushort, ushort, ushort);
 
-// ---- Tokens ----
-
-struct EmbedParams { uint n_embd; uint token_index; };
-
-// x[row][:] = table[tokens[token_index + row]][:]. A decode step's input is the token the previous step's argmax wrote, read here without the host.
-kernel void embed(device const half * table [[buffer(0)]], device const int * tokens [[buffer(1)]], device float * x [[buffer(2)]],
-                  constant EmbedParams & p [[buffer(3)]], uint2 gp [[thread_position_in_grid]]) {
-    const uint i = gp.x, row = gp.y;
-    if (i >= p.n_embd) return;
-    x[(ulong)row * p.n_embd + i] = float(table[(ulong)tokens[p.token_index + row] * p.n_embd + i]);
+// Float to half (the cross-attention keys and values of an audio window, computed once into a float scratch by matmul_big).
+kernel void to_half(device const float * src [[buffer(0)]], device half * dst [[buffer(1)]], constant uint & n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i < n) dst[i] = half(src[i]);
 }
 
-struct ArgmaxParams { uint n; uint out_index; };
+// ---- Tokens ----
 
-// tokens[out_index] = argmax(logits) (the lowest index among equal maxima). One threadgroup.
+struct EmbedParams { uint n_embd; uint token_index; uint pos; uint use_pos; };
+
+// x[row][:] = table[tokens[token_index + row]][:] (+ pos_table[pos + row][:] when use_pos: Whisper's learned positions). A decode step's input is the token
+// the previous step's argmax wrote, read here without the host.
+kernel void embed(device const half * table [[buffer(0)]], device const int * tokens [[buffer(1)]], device float * x [[buffer(2)]],
+                  constant EmbedParams & p [[buffer(3)]], device const float * pos_table [[buffer(4)]], uint2 gp [[thread_position_in_grid]]) {
+    const uint i = gp.x, row = gp.y;
+    if (i >= p.n_embd) return;
+    float v = float(table[(ulong)tokens[p.token_index + row] * p.n_embd + i]);
+    if (p.use_pos) v += pos_table[(ulong)(p.pos + row) * p.n_embd + i];
+    x[(ulong)row * p.n_embd + i] = v;
+}
+
+struct ArgmaxParams { uint n; uint out_index; uint use_mask; };
+
+// tokens[out_index] = argmax(logits + mask) (the lowest index among equal maxima; mask: 0 or -inf per token, Whisper's suppressed tokens). One threadgroup.
 kernel void argmax(device const float * logits [[buffer(0)]], device int * tokens [[buffer(1)]], constant ArgmaxParams & p [[buffer(2)]],
+                   device const float * mask [[buffer(3)]],
                    uint tid [[thread_index_in_threadgroup]], uint nthreads [[threads_per_threadgroup]],
                    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float bv[32];
@@ -697,7 +745,7 @@ kernel void argmax(device const float * logits [[buffer(0)]], device int * token
     float best = -INFINITY;
     int idx = 0;
     for (uint i = tid; i < p.n; i += nthreads) {
-        const float v = logits[i];
+        const float v = logits[i] + (p.use_mask ? mask[i] : 0.f);
         if (v > best) { best = v; idx = int(i); }
     }
     for (ushort off = 16; off > 0; off >>= 1) {

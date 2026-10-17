@@ -238,6 +238,43 @@ DOOMS_API dooms_code dooms_vla_runner_next_action(dooms_vla_runner * runner, dou
 DOOMS_API dooms_code dooms_vla_runner_wait_idle(dooms_vla_runner * runner, double timeout_s, int32_t * idle);
 DOOMS_API dooms_code dooms_vla_runner_stats_get(dooms_vla_runner * runner, dooms_vla_runner_stats * out);
 
+/* ---------------------------------------------------------------- speech to text (Whisper: encoder on Core ML, the engine's own Metal decoder)
+ * Greedy decoding without timestamps, 30-second windows one after another. Files from tools/convert/convert_whisper.py (docs/formats/whisper-gguf.md). */
+typedef struct dooms_whisper dooms_whisper;
+
+typedef struct dooms_whisper_paths {
+    size_t struct_size;
+    const char * encoder;  /* encoder-fp16.mlpackage */
+    const char * decoder;  /* decoder.gguf */
+} dooms_whisper_paths;
+
+typedef struct dooms_whisper_options {
+    size_t struct_size;
+    const char * units;        /* the encoder's Core ML units: "all", "cpu_gpu", "cpu_ne", "cpu"; NULL: cpu_gpu (more accurate and faster than the Neural Engine here) */
+    const char * language;     /* a code the model knows ("en", "de", ...); NULL: "en" */
+    const char * task;         /* "transcribe" or "translate" (into English); NULL: "transcribe" */
+    int32_t max_tokens;        /* text tokens per 30-s window, [1, 224]; 0: 224 */
+} dooms_whisper_options;
+
+typedef struct dooms_whisper_timings {
+    size_t struct_size;
+    double features_ms, encoder_ms, decode_ms, total_ms;  /* wall time of the last transcription, per stage and in all (audio decoding excluded) */
+    double audio_s;                                       /* its duration */
+    int32_t windows, tokens;                              /* 30-s windows and generated text tokens */
+} dooms_whisper_timings;
+
+DOOMS_API dooms_code dooms_whisper_open(const dooms_whisper_paths * paths, const dooms_whisper_options * options, dooms_whisper ** out);
+DOOMS_API void dooms_whisper_close(dooms_whisper * whisper);
+DOOMS_API int32_t dooms_whisper_sample_rate(const dooms_whisper * whisper);   /* 16000; 0 for NULL */
+/* n mono samples in [-1, 1] at dooms_whisper_sample_rate -> NUL-terminated UTF-8 text, with *needed and DOOMS_RESOURCE_EXHAUSTED as dooms_llm_generate. A text that
+ * did not fit stays in the handle: dooms_whisper_last_text fetches it without transcribing again. */
+DOOMS_API dooms_code dooms_whisper_transcribe(dooms_whisper * whisper, const float * samples, size_t n, char * out, size_t capacity, size_t * needed);
+/* Any audio file Core Audio decodes (WAV, AIFF, CAF, MP3, M4A/AAC, FLAC, ...), resampled to the model's rate and mixed to mono. */
+DOOMS_API dooms_code dooms_whisper_transcribe_file(dooms_whisper * whisper, const char * path, char * out, size_t capacity, size_t * needed);
+/* The text of the last successful transcription (DOOMS_NOT_FOUND before one). */
+DOOMS_API dooms_code dooms_whisper_last_text(const dooms_whisper * whisper, char * out, size_t capacity, size_t * needed);
+DOOMS_API dooms_code dooms_whisper_last_timings(const dooms_whisper * whisper, dooms_whisper_timings * out);
+
 #ifdef __cplusplus
 }
 #endif

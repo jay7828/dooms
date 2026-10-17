@@ -191,6 +191,17 @@
              <p><strong>Fastest f16 decode</strong>: the engine's own Metal decoder runs Qwen2 and llama files. The prompt is 13% behind llama.cpp, ahead of MLX and PyTorch.</p>
              <p>Quantized files still run on llama.cpp inside the engine. Answers match transformers token for token, 29 of 29.</p>`,
     },
+    speech: {
+      title: "Whisper speech to text",
+      sub: "481 s of LibriSpeech audio, greedy, f16",
+      charts: [
+        { title: "large-v3-turbo, 73 clips, seconds, lower is better", rows: D.speech.turboClips.map((t) => ({ sys: t.sys, name: t.name, value: t.s })), unit: "s", better: "lower" },
+        { title: "large-v3-turbo, one 8-minute file, seconds, lower is better", rows: D.speech.turboLong.map((t) => ({ sys: t.sys, name: t.name, value: t.s })), unit: "s", better: "lower" },
+        { title: "tiny, 73 clips, seconds, lower is better", rows: D.speech.tinyClips.map((t) => ({ sys: t.sys, name: t.name, value: t.s })), unit: "s", better: "lower" },
+      ],
+      note: `<p><strong>Level with MLX, ahead of everything else</strong>: 1.2 to 2.3x whisper.cpp, 1.9 to 6.7x PyTorch, 15 to 21x Sapient. Ahead of MLX on long audio, 2 to 5% behind on short clips.</p>
+             <p>The encoder runs on Core ML (the GPU: on the Neural Engine it was slower and less accurate), the decoder on the engine's own Metal kernels. Word error rate equals PyTorch's: 3.25% for turbo.</p>`,
+    },
     vit: {
       title: "A 631M-parameter ViT",
       sub: "one forward pass, GPU only, 1280 wide and 32 blocks",
