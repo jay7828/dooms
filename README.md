@@ -74,12 +74,19 @@ Tokens match transformers' on the reference prompts, photos and audio clips for 
 pip install dooms-cpp                         # PyPI; the import and the command are both `dooms`
 dooms pull qwen2.5-0.5b                       # downloads and verifies a GGUF (SHA-256)
 dooms serve --model ~/.cache/dooms/qwen2.5-0.5b-instruct-q4_k_m.gguf   # OpenAI-compatible API on 127.0.0.1:8080
+dooms pull whisper-large-v3-turbo             # speech to text, ready converted (1.5 GB; whisper-tiny: 69 MB)
+dooms pull kokoro                             # text to speech, ready converted, 54 voices (237 MB)
 ```
 
 ```python
 import dooms
 llm = dooms.LLM("qwen2.5-0.5b-instruct-f16.gguf")      # f16 llama/qwen2: the engine's own Metal decoder
 print(llm.chat([{"role": "user", "content": "Name three colours."}], max_new_tokens=48))
+
+stt = dooms.Whisper("~/.cache/dooms/whisper-large-v3-turbo")
+print(stt.transcribe("meeting.m4a"))
+tts = dooms.TTS("~/.cache/dooms/kokoro")                 # pip install "misaki[en]" for English text
+dooms.save_wav("hello.wav", tts.speak("Hello from dooms.cpp."), tts.sample_rate)
 ```
 
 ```cpp
@@ -88,8 +95,8 @@ dooms::Llm llm("qwen2.5-0.5b-instruct-f16.gguf");
 std::cout << llm.chat({{"user", "Name three colours."}}, 48) << "\n";
 ```
 
-See [docs/USING.md](docs/USING.md) for installation and the full API (LLM, VLM, VLA and the asynchronous runner, the server, `dooms pull`). Models are not
-included.
+See [docs/USING.md](docs/USING.md) for installation and the full API (LLM, VLM, VLA and the asynchronous runner, Whisper, TTS, the server, `dooms pull`).
+Models are not bundled in the package: `dooms pull` fetches them (Whisper and Kokoro as ready converted files, with their licences).
 
 ## Build
 ```

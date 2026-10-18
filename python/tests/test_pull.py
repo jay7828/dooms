@@ -337,7 +337,7 @@ class PullTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.dir, "escape.txt")))
 
     def test_conversion_needs_a_source_checkout(self):
-        with mock.patch.dict(os.environ, {"DOOMS_SOURCE_DIR": self.dir}):
+        with mock.patch.dict(os.environ, {"DOOMS_SOURCE_DIR": self.dir}), mock.patch.dict(pull.PREBUILT, {}, clear=True):   # the conversion path of every one
             for name in pull.CONVERTED:
                 msg = self.expect_error(name, "no converters", "never redistributed", "pip install", f"pull {name}")
                 self.assertEqual("lerobot" in msg, name == "smolvla")
@@ -351,6 +351,86 @@ class PullTest(unittest.TestCase):
             msg = self.expect_error("smolvlm")  # this interpreter lacks torch & co, or (if it has them) the missing llama.cpp is reported
             self.assertTrue(("cannot import" in msg and "DOOMS_CONVERT_PYTHON" in msg) or ("convert_hf_to_gguf.py" in msg and "DOOMS_LLAMA_CPP_DIR" in msg), msg)
         self.assertEqual(self.hub.log, [])
+
+    # ---------------------------------------------------------------- prebuilt archives (whisper-*, kokoro)
+
+    def make_archive(self, name, extra=None):
+        """A tar.gz shaped like scripts/package-models.py's: name/LICENSE, name/model.bin, name/pkg/Manifest.json; `extra` adds hostile entries."""
+        import tarfile  # noqa: PLC0415
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w:gz") as tar:
+            def add(path, data, kind=tarfile.REGTYPE, link=""):
+                info = tarfile.TarInfo(path)
+                info.type, info.linkname, info.size = kind, link, len(data)
+                tar.addfile(info, io.BytesIO(data) if kind == tarfile.REGTYPE else None)
+            add(f"{name}/LICENSE", b"MIT\n")
+            add(f"{name}/model.bin", bytes(range(256)) * 400)
+            add(f"{name}/pkg/Manifest.json", b"{}")
+            for e in extra or []:
+                add(*e)
+        return raw.getvalue()
+
+    def serve_prebuilt(self, name, data, sha=None):
+        self.hub.files["asset.tar.gz"] = data
+        entry = pull.Prebuilt("asset.tar.gz", len(data), sha or hashlib.sha256(data).hexdigest(), "test model")
+        patches = [mock.patch.dict(pull.PREBUILT, {name: entry}, clear=True),
+                   mock.patch.object(pull, "PREBUILT_URL", f"http://localhost:{self.hub.port}/cdn/{{file}}"),
+                   mock.patch.object(pull, "_check_loads", mock.Mock())]
+        for m in patches:
+            m.start()
+            self.addCleanup(m.stop)
+        return patches[2].new if hasattr(patches[2], "new") else pull._check_loads
+
+    def test_prebuilt_downloads_verifies_extracts(self):
+        data = self.make_archive("kokoro")
+        self.serve_prebuilt("kokoro", data)
+        path, err = self.run_pull("kokoro")
+        self.assertEqual(path, os.path.join(self.dir, "kokoro"))
+        with open(os.path.join(path, "model.bin"), "rb") as f:
+            self.assertEqual(f.read(), bytes(range(256)) * 400)
+        self.assertTrue(os.path.isfile(os.path.join(path, "pkg", "Manifest.json")))
+        pull._check_loads.assert_called_once()                                     # checked before it was moved into place
+        self.assertTrue(pull._check_loads.call_args[0][1].endswith(".extracting"))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "downloads", "asset.tar.gz")))   # the archive is not kept
+        self.assertFalse(os.path.exists(path + ".extracting"))
+
+    def test_prebuilt_refuses_a_changed_asset(self):
+        data = self.make_archive("kokoro")
+        self.serve_prebuilt("kokoro", data, sha="0" * 64)
+        self.expect_error("kokoro", "checksum mismatch")
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "kokoro")))
+        pull._check_loads.assert_not_called()
+
+    def test_prebuilt_refuses_hostile_archives(self):
+        import tarfile  # noqa: PLC0415
+        for bad in [("kokoro/../escape.txt", b"x"), ("/abs.txt", b"x"), ("kokoro/link", b"", tarfile.SYMTYPE, "/etc/passwd"), ("other/file", b"x")]:
+            with self.subTest(bad[0]):
+                for leftover in ("kokoro", "kokoro.extracting", "downloads"):
+                    import shutil  # noqa: PLC0415
+                    shutil.rmtree(os.path.join(self.dir, leftover), ignore_errors=True)
+                self.serve_prebuilt("kokoro", self.make_archive("kokoro", [bad]))
+                self.expect_error("kokoro", "unexpected entry")
+                self.assertFalse(os.path.exists(os.path.join(self.dir, "kokoro")))
+                self.assertFalse(os.path.exists(os.path.join(self.dir, "escape.txt")))
+
+    def test_prebuilt_load_failure_leaves_nothing_in_place(self):
+        self.serve_prebuilt("kokoro", self.make_archive("kokoro"))
+        pull._check_loads.side_effect = RuntimeError("does not load")
+        with self.assertRaises(RuntimeError), redirect_stderr(io.StringIO()):
+            pull.pull("kokoro", progress=None)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "kokoro")))
+
+    def test_prebuilt_resumes(self):
+        data = self.make_archive("kokoro")
+        self.serve_prebuilt("kokoro", data)
+        self.hub.break_after = len(data) // 3
+        with mock.patch.object(pull, "DOWNLOAD_ATTEMPTS", 1), self.assertRaises(pull.TransientError), redirect_stderr(io.StringIO()):
+            pull.pull("kokoro", progress=None)
+        self.hub.break_after = None
+        path, _ = self.run_pull("kokoro")
+        ranges = [h.get("Range") for m, p, h in self.hub.log if p.startswith("/cdn/")]
+        self.assertTrue(any(r and r.startswith("bytes=") for r in ranges))
+        self.assertTrue(os.path.isdir(path))
 
     def test_models_dir_and_list(self):
         self.assertEqual(pull.models_dir(), os.path.abspath(self.dir))

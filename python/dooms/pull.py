@@ -2,7 +2,8 @@
 
     dooms pull qwen2.5-0.5b                                   # an alias of ALIASES: a GGUF from its publisher's own repository, pinned to a commit
     dooms pull hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf[@REVISION]
-    dooms pull smolvlm | smolvla | whisper-tiny | whisper-large-v3-turbo | kokoro   # original weights + local conversion (source checkout only, see CONVERTED)
+    dooms pull whisper-tiny | whisper-large-v3-turbo | kokoro   # converted files (PREBUILT), checked by pinned SHA-256; --convert converts the originals
+    dooms pull smolvlm | smolvla                              # original weights + local conversion (source checkout only, see CONVERTED)
 
 Every file is checked against the hash Hugging Face publishes for it (the SHA-256 of an LFS file, `lfs.oid` in the paths-info API; the git blob SHA-1 of a small
 file, `oid`). Downloads go to `<file>.part`, resume with an HTTP Range request, and are renamed into place only after the check; a mismatch deletes the partial file.
@@ -84,6 +85,26 @@ WHISPER: Dict[str, Tuple[Snapshot, float]] = {
 KOKORO = Snapshot("hexgrad/Kokoro-82M", "f3ff3571791e39611d31c381e3a41a3af07b4987", ("eval/", "samples/"))
 KOKORO_MODULES = ("torch", "kokoro", "coremltools", "gguf")
 CONVERTED = ("smolvlm", "smolvla") + tuple(WHISPER) + ("kokoro",)
+
+
+@dataclass(frozen=True)
+class Prebuilt:
+    file: str
+    size: int
+    sha256: str
+    note: str
+
+
+# Converted archives of the permissively licensed models (docs/adr/0002 addendum 2026-10-18; scripts/package-models.py), assets of the jay7828/dooms release
+# PREBUILT_RELEASE. The hash is pinned here, so a changed asset is refused. `dooms pull NAME` downloads these; `--convert` converts the original weights instead.
+PREBUILT_RELEASE = "models-v1"
+PREBUILT_URL = "https://github.com/jay7828/dooms/releases/download/{release}/{file}"
+PREBUILT: Dict[str, Prebuilt] = {
+    "whisper-tiny": Prebuilt("dooms-whisper-tiny.tar.gz", 69470346, "535f30c77f4819d31143794195fd067bc91c428016d0bdd351bae71a0b695dbb", "Whisper tiny (OpenAI, MIT)"),
+    "whisper-large-v3-turbo": Prebuilt("dooms-whisper-large-v3-turbo.tar.gz", 1492091280, "6e2d98a483854d127476d32c4011704104882ef63e8b813a3c8060e45de6d171",
+                                       "Whisper large-v3-turbo (OpenAI, MIT)"),
+    "kokoro": Prebuilt("dooms-kokoro.tar.gz", 237102426, "b5fa9026c663e2c75f141c892fb18fd4dddfef59c9955f6d05b842f2abaf2b80", "Kokoro-82M, 54 voices (hexgrad, Apache-2.0)"),
+}
 CONVERT_MODULES = ("torch", "coremltools", "transformers", "gguf", "safetensors", "huggingface_hub")   # what tools/convert imports
 LEROBOT_MODULES = ("torch", "lerobot")                                                                  # tools/parity/smolvla_reference.py
 
@@ -257,13 +278,14 @@ def stderr_progress(name: str, done: int, total: int) -> None:
         print(f"  {name}: {pct}% of {total / 1e6:,.1f} MB", file=sys.stderr, flush=True)
 
 
-def download(repo: str, commit: str, f: RemoteFile, dest: str, progress: Optional[Progress] = stderr_progress, attempts: Optional[int] = None) -> str:
+def download(repo: str, commit: str, f: RemoteFile, dest: str, progress: Optional[Progress] = stderr_progress, attempts: Optional[int] = None,
+             url: Optional[str] = None) -> str:
     """Downloads one file to `dest` and verifies it, resuming up to `attempts` times after a network failure. Returns "present" (already there and verified) or
-    "downloaded"."""
+    "downloaded". `url` (optional) replaces the Hugging Face address built from repo / commit / path (a release asset with a pinned hash)."""
     attempts = attempts or DOWNLOAD_ATTEMPTS
     for attempt in range(1, attempts + 1):
         try:
-            return _download_once(repo, commit, f, dest, progress)
+            return _download_once(repo, commit, f, dest, progress, url)
         except TransientError as e:
             if attempt == attempts:
                 raise
@@ -272,7 +294,7 @@ def download(repo: str, commit: str, f: RemoteFile, dest: str, progress: Optiona
     raise AssertionError("unreachable")
 
 
-def _download_once(repo: str, commit: str, f: RemoteFile, dest: str, progress: Optional[Progress]) -> str:
+def _download_once(repo: str, commit: str, f: RemoteFile, dest: str, progress: Optional[Progress], direct_url: Optional[str] = None) -> str:
     name = os.path.basename(dest)
     if os.path.exists(dest):
         if verify(dest, f):
@@ -288,7 +310,7 @@ def _download_once(repo: str, commit: str, f: RemoteFile, dest: str, progress: O
     if have:
         if _hash_file(part, h) != have:
             raise PullError(f"{part} changed while it was being read; run the command again")
-    url = f"{hf_endpoint()}/{_quote(repo)}/resolve/{commit}/{_quote(f.path)}"
+    url = direct_url or f"{hf_endpoint()}/{_quote(repo)}/resolve/{commit}/{_quote(f.path)}"
     if have < f.size:
         headers = {"Range": f"bytes={have}-"} if have else {}
         try:
@@ -296,7 +318,7 @@ def _download_once(repo: str, commit: str, f: RemoteFile, dest: str, progress: O
         except urllib.error.HTTPError as e:  # 416: the server cannot serve that range; start over
             e.close()
             os.remove(part)
-            return _download_once(repo, commit, f, dest, progress)
+            return _download_once(repo, commit, f, dest, progress, direct_url)
         with resp:
             status = resp.status
             if have and status == 206:
@@ -502,9 +524,69 @@ def pull_converted(name: str, target_dir: str, progress: Optional[Progress] = st
     return out
 
 
-def pull(name: str, target_dir: Optional[str] = None, progress: Optional[Progress] = stderr_progress) -> str:
-    """Downloads (and, for the CONVERTED models, converts) `name`; returns the path of the model file or directory."""
+def _extract(archive: str, name: str, dest: str) -> None:
+    """Unpacks `archive` (one top-level directory `name`) into `dest`. Only regular files and directories inside `name/` are accepted: no links, devices,
+    absolute paths or `..` (the archive is verified by hash first; this guards the extraction itself)."""
+    import tarfile  # noqa: PLC0415
+    os.makedirs(dest, exist_ok=True)
+    root = os.path.realpath(dest)
+    with tarfile.open(archive, "r:gz") as tar:
+        for m in tar.getmembers():
+            parts = m.name.split("/")
+            if m.name.startswith("/") or ".." in parts or parts[0] != name or not (m.isfile() or m.isdir()):
+                raise PullError(f"{archive}: unexpected entry {m.name!r}; nothing was extracted into place")
+            rel = "/".join(parts[1:])
+            if not rel:
+                continue
+            target = os.path.realpath(os.path.join(dest, rel))
+            if not target.startswith(root + os.sep):
+                raise PullError(f"{archive}: entry {m.name!r} leaves the target directory")
+            if m.isdir():
+                os.makedirs(target, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            src = tar.extractfile(m)
+            with open(target, "wb") as out:
+                while True:
+                    b = src.read(CHUNK_BYTES)
+                    if not b:
+                        break
+                    out.write(b)
+
+
+def pull_prebuilt(name: str, target_dir: str, progress: Optional[Progress] = stderr_progress, keep_archive: bool = False) -> str:
+    """Downloads the converted archive of `name` (pinned size and SHA-256), unpacks it, checks that it loads, moves it into place."""
+    p = PREBUILT[name]
+    archive = os.path.join(target_dir, "downloads", p.file)
+    url = PREBUILT_URL.format(release=PREBUILT_RELEASE, file=p.file)
+    print(f"{name}: {p.note}, converted ({p.size / 1e6:,.1f} MB) -> {os.path.join(target_dir, name)}", file=sys.stderr)
+    download(f"jay7828/dooms release {PREBUILT_RELEASE}", PREBUILT_RELEASE, RemoteFile(p.file, p.size, "sha256", p.sha256), archive, progress, url=url)
+    out = os.path.join(target_dir, name)
+    tmp = out + ".extracting"
+    if os.path.exists(tmp):
+        import shutil  # noqa: PLC0415
+        shutil.rmtree(tmp)
+    _extract(archive, name, tmp)
+    _check_loads(name, tmp)
+    if os.path.exists(out):
+        backup = out + ".previous"
+        if os.path.exists(backup):
+            raise PullError(f"{backup} is in the way; delete it (or {out}) and run the command again")
+        os.replace(out, backup)
+        print(f"the previous {out} was kept as {backup}", file=sys.stderr)
+    os.replace(tmp, out)
+    if not keep_archive:
+        os.remove(archive)
+    print(f"{out}: ready (open it with {'dooms.TTS' if name == 'kokoro' else 'dooms.Whisper'})", file=sys.stderr)
+    return out
+
+
+def pull(name: str, target_dir: Optional[str] = None, progress: Optional[Progress] = stderr_progress, convert: bool = False) -> str:
+    """Downloads `name`: a GGUF alias, a prebuilt archive (PREBUILT), or, for the CONVERTED models (all of them with convert=True), the original weights
+    converted locally. Returns the path of the model file or directory."""
     d = models_dir(target_dir)
+    if name in PREBUILT and not convert:
+        return pull_prebuilt(name, d, progress)
     if name.startswith("hf:"):
         repo, path, revision = parse_hf(name)
         return pull_gguf(repo, path, revision, d, progress)

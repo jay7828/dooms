@@ -412,6 +412,7 @@ class Whisper(_Handle):
         super().__init__()
         self._require("dooms_whisper_open")
         if model_dir is not None:
+            model_dir = os.path.expanduser(os.fspath(model_dir))
             encoder = encoder or os.path.join(model_dir, "encoder-fp16.mlpackage")
             decoder = decoder or os.path.join(model_dir, "decoder.gguf")
         if not encoder or not decoder:
@@ -500,6 +501,7 @@ class TTS(_Handle):
         super().__init__()
         self._require("dooms_tts_open")
         if model_dir is not None:
+            model_dir = os.path.expanduser(os.fspath(model_dir))
             prosody = prosody or os.path.join(model_dir, "prosody-fp32.mlpackage")
             f0n = f0n or os.path.join(model_dir, "f0n-fp32.mlpackage")
             model = model or os.path.join(model_dir, "kokoro.gguf")

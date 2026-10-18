@@ -59,7 +59,7 @@ def _pull(args) -> int:
     from . import pull  # noqa: PLC0415
 
     try:
-        path = pull.pull(args.name, args.dir)
+        path = pull.pull(args.name, args.dir, convert=args.convert)
     except pull.PullError as e:
         print(f"dooms pull: {e}", file=sys.stderr)
         return 1
@@ -108,10 +108,13 @@ def _parser() -> argparse.ArgumentParser:
     aliases = "; ".join(f"{k}: {a.note} ({a.repo})" for k, a in pull.ALIASES.items())
     default_dir = f"${pull.MODELS_ENV}, else {pull.DEFAULT_MODELS_DIR}"
     d = sub.add_parser("pull", help="download a model from Hugging Face and verify it",
-                       description=f"Downloads a GGUF and checks it against Hugging Face's published hash (resumable). Aliases: {aliases}. smolvlm, smolvla, whisper-tiny, "
-                                   "whisper-large-v3-turbo and kokoro download the original weights and convert them locally (source checkout with the converter environment only).")
+                       description=f"Downloads a GGUF and checks it against Hugging Face's published hash (resumable). Aliases: {aliases}. whisper-tiny, "
+                                   "whisper-large-v3-turbo and kokoro download ready converted files (SHA-256 pinned in the package; --convert converts the original "
+                                   "weights instead). smolvlm and smolvla download the original weights and convert them locally (source checkout with the converter "
+                                   "environment only).")
     d.add_argument("name", help="an alias, hf:OWNER/REPO/FILE.gguf[@REVISION], smolvlm, smolvla, whisper-* or kokoro")
     d.add_argument("--dir", default=None, help=f"models directory (default {default_dir})")
+    d.add_argument("--convert", action="store_true", help="whisper-* / kokoro: convert the original weights locally instead of downloading the converted files")
     d.set_defaults(func=_pull)
     li = sub.add_parser("list", help="show what is in the models directory")
     li.add_argument("--dir", default=None, help=f"models directory (default {default_dir})")

@@ -21,12 +21,12 @@ for piece in llm.stream_chat([{"role": "user", "content": "Tell a short story."}
 vlm = dooms.VLM.from_dir("models/smolvlm");  vlm.generate(rgb_array, "Describe this image.")
 vla = dooms.VLA.from_dir("models/smolvla");  vla.infer([cam1, cam2, cam3], "pick up the red cube", state)
 
-# Speech to text (Whisper; dooms pull whisper-large-v3-turbo, or tools/convert/convert_whisper.py)
-stt = dooms.Whisper("models/whisper-large-v3-turbo")
+# Speech to text (Whisper; dooms pull whisper-large-v3-turbo)
+stt = dooms.Whisper("~/.cache/dooms/whisper-large-v3-turbo")
 print(stt.transcribe("meeting.m4a"), stt.last_timings.rtf)        # a file Core Audio decodes, or 16 kHz mono float samples
 
-# Text to speech (Kokoro-82M; dooms pull kokoro, or tools/convert/convert_kokoro.py; English text needs pip install "misaki[en]")
-tts = dooms.TTS("models/kokoro")
+# Text to speech (Kokoro-82M; dooms pull kokoro; English text needs pip install "misaki[en]")
+tts = dooms.TTS("~/.cache/dooms/kokoro")
 dooms.save_wav("hello.wav", tts.speak("Hello from dooms.cpp.", voice="af_heart"), tts.sample_rate)
 audio = tts.synthesize("həlˈO wˈɜɹld.", voice="bm_george", speed=1.1, seed=1)   # phonemes directly; the same seed gives the same samples
 ```
@@ -37,8 +37,8 @@ string. Each call is a fresh conversation. Errors raise `dooms.DoomsError` (`.co
 ## C++
 
 ```
-curl -LO https://github.com/jay7828/dooms/releases/download/v0.5.0/dooms-sdk-0.5.0-macos-arm64.tar.gz && tar xzf dooms-sdk-0.5.0-macos-arm64.tar.gz   # or scripts/package-sdk.sh
-cmake -S examples/cpp -B build -DCMAKE_PREFIX_PATH=$PWD/dooms-sdk-0.5.0-macos-arm64
+curl -LO https://github.com/jay7828/dooms/releases/download/v0.5.1/dooms-sdk-0.5.1-macos-arm64.tar.gz && tar xzf dooms-sdk-0.5.1-macos-arm64.tar.gz   # or scripts/package-sdk.sh
+cmake -S examples/cpp -B build -DCMAKE_PREFIX_PATH=$PWD/dooms-sdk-0.5.1-macos-arm64
 ```
 
 ```cpp
@@ -119,10 +119,11 @@ dooms list                                       # what is in the models directo
   `.venv` with torch, coremltools, transformers, gguf, safetensors, huggingface_hub (plus `.venv-lerobot` with LeRobot for SmolVLA); run
   `PYTHONPATH=python .venv/bin/python -m dooms pull smolvlm` there. Override with `DOOMS_SOURCE_DIR`, `DOOMS_CONVERT_PYTHON`, `DOOMS_LEROBOT_PYTHON`,
   `DOOMS_LLAMA_CPP_DIR`. From a wheel install it stops with these instructions.
-- `dooms pull whisper-tiny` / `dooms pull whisper-large-v3-turbo`: the same, from openai/whisper-tiny or openai/whisper-large-v3-turbo (MIT) into `<dir>/whisper-*`
-  (encoder-fp16.mlpackage + decoder.gguf; turbo's encoder conversion takes about 17 minutes). No llama.cpp needed.
-- `dooms pull kokoro`: hexgrad/Kokoro-82M (Apache-2.0, all 54 voices) converted into `<dir>/kokoro` with the reference package installed in its own environment
-  (`.venv-kokoro`: `kokoro==0.9.4 'misaki[en]' torch==2.8.0 coremltools==9.0 gguf`; `DOOMS_KOKORO_PYTHON` overrides it).
+- `dooms pull whisper-tiny` / `whisper-large-v3-turbo` / `kokoro`: ready converted files (OpenAI's Whisper, MIT; hexgrad's Kokoro-82M with all 54 voices,
+  Apache-2.0), 69 MB / 1.5 GB / 237 MB, from the `models-v1` release of this repository. Size and SHA-256 are pinned in the package, the download resumes, the
+  archive (the model's licence and provenance inside) is unpacked, checked to load, and moved into `<dir>/<name>`. Works from a wheel install.
+  `--convert` instead converts the original weights in a source checkout (Whisper: `.venv` as above; Kokoro: `.venv-kokoro` with
+  `kokoro==0.9.4 'misaki[en]' torch==2.8.0 coremltools==9.0 gguf`, or `DOOMS_KOKORO_PYTHON`).
 - By hand, any Hugging Face checkpoint llama.cpp supports:
 
 ```
