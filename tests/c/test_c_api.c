@@ -338,6 +338,54 @@ int main(void) {
         }
     }
 
+    /* text to speech: argument checks always; with DOOMS_TTS_DIR (converted Kokoro) the real model (CTest c_api_tts) */
+    {
+        dooms_tts * t = (dooms_tts *) 1;
+        dooms_tts_paths tp;
+        dooms_tts_timings tt;
+        float small[8];
+        size_t needed = 0;
+        CHECK(dooms_tts_open(NULL, NULL, &t) == DOOMS_INVALID_ARGUMENT && t == NULL);
+        memset(&tp, 0, sizeof tp);
+        CHECK(dooms_tts_open(&tp, NULL, &t) == DOOMS_INVALID_ARGUMENT);
+        tp.struct_size = sizeof tp;
+        CHECK(dooms_tts_open(&tp, NULL, &t) == DOOMS_INVALID_ARGUMENT);
+        tp.prosody = "/nonexistent/prosody-fp32.mlpackage";
+        tp.f0n = "/nonexistent/f0n-fp32.mlpackage";
+        tp.model = "/nonexistent/kokoro.gguf";
+        CHECK(dooms_tts_open(&tp, NULL, &t) == DOOMS_NOT_FOUND && t == NULL);
+        CHECK(dooms_tts_synthesize(NULL, "a", "af_heart", 1.f, 0, small, 8, NULL) == DOOMS_INVALID_ARGUMENT);
+        CHECK(dooms_tts_sample_rate(NULL) == 0 && dooms_tts_voice_count(NULL) == 0 && dooms_tts_voice_name(NULL, 0) == NULL);
+        dooms_tts_close(NULL);
+        if (getenv("DOOMS_TTS_DIR") && *getenv("DOOMS_TTS_DIR")) {
+            char p1[1024], p2[1024], p3[1024];
+            float * audio;
+            snprintf(p1, sizeof p1, "%s/prosody-fp32.mlpackage", getenv("DOOMS_TTS_DIR"));
+            snprintf(p2, sizeof p2, "%s/f0n-fp32.mlpackage", getenv("DOOMS_TTS_DIR"));
+            snprintf(p3, sizeof p3, "%s/kokoro.gguf", getenv("DOOMS_TTS_DIR"));
+            tp.prosody = p1; tp.f0n = p2; tp.model = p3;
+            CHECK(dooms_tts_open(&tp, NULL, &t) == DOOMS_OK);
+            if (t) {
+                CHECK(dooms_tts_sample_rate(t) == 24000 && dooms_tts_max_phonemes(t) > 100 && dooms_tts_voice_count(t) > 0);
+                CHECK(dooms_tts_voice_name(t, 0) != NULL && dooms_tts_voice_name(t, dooms_tts_voice_count(t)) == NULL);
+                CHECK(dooms_tts_last_audio(t, small, 8, NULL) == DOOMS_NOT_FOUND);
+                CHECK(dooms_tts_synthesize(t, "h\xC9\x99l\xCB\x88O", "nobody", 1.f, 0, small, 8, NULL) == DOOMS_INVALID_ARGUMENT);
+                CHECK(dooms_tts_synthesize(t, "h\xC9\x99l\xCB\x88O", dooms_tts_voice_name(t, 0), 0.f, 0, small, 8, NULL) == DOOMS_INVALID_ARGUMENT);
+                /* too small: the needed size is reported, the samples are kept */
+                CHECK(dooms_tts_synthesize(t, "h\xC9\x99l\xCB\x88O w\xCB\x88\xC9\x9C\xC9\xB9ld.", dooms_tts_voice_name(t, 0), 1.f, 7, small, 8, &needed) == DOOMS_RESOURCE_EXHAUSTED);
+                CHECK(needed > 24000 / 2 && needed % 600 == 0);
+                audio = (float *) malloc(needed * sizeof(float));
+                CHECK(audio && dooms_tts_last_audio(t, audio, needed, NULL) == DOOMS_OK);
+                memset(&tt, 0, sizeof tt);
+                tt.struct_size = sizeof tt;
+                CHECK(dooms_tts_last_timings(t, &tt) == DOOMS_OK && tt.frames * 600 == (int32_t) needed && tt.total_ms > 0 && tt.vocoder_ms > 0);
+                printf("        tts: %.2f s of audio in %.0f ms\n", tt.audio_s, tt.total_ms);
+                free(audio);
+                dooms_tts_close(t);
+            }
+        }
+    }
+
     /* the last error is per call: a successful call clears it */
     CHECK(dooms_c_api_version() == DOOMS_C_API_VERSION);
     printf("%s\n", failures ? "FAILED" : "c api: ok");

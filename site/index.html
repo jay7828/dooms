@@ -85,6 +85,7 @@
         <button role="tab" aria-selected="false" data-tab="vlm">SmolVLM</button>
         <button role="tab" aria-selected="false" data-tab="llm">LLM</button>
         <button role="tab" aria-selected="false" data-tab="speech">Speech</button>
+        <button role="tab" aria-selected="false" data-tab="tts">TTS</button>
         <button role="tab" aria-selected="false" data-tab="vit">ViT on the GPU</button>
       </div>
       <div class="bench-body">
@@ -155,7 +156,7 @@ for piece in llm.stream("Once upon a time", 200, temperature=0.8, seed=1):
 
 vla = dooms.VLA.from_dir("models/smolvla")
 actions = vla.infer([cam1, cam2, cam3], "pick up the red cube", state)</code></pre>
-<pre data-code="cpp" hidden><code><span class="c">// find_package(dooms 0.4 REQUIRED)  target_link_libraries(app PRIVATE dooms::dooms)</span>
+<pre data-code="cpp" hidden><code><span class="c">// find_package(dooms 0.5 REQUIRED)  target_link_libraries(app PRIVATE dooms::dooms)</span>
 #include &lt;dooms/dooms.hpp&gt;
 
 dooms::Llm llm("qwen2.5-0.5b-instruct-q4_k_m.gguf");

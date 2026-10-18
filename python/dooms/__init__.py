@@ -10,6 +10,8 @@
     runner = vla.runner(control_hz=30)                # asynchronous chunks for a control loop: wants_observation / submit / next_action
     stt = dooms.Whisper("models/whisper/whisper-large-v3-turbo/dooms")
     print(stt.transcribe("speech.wav"))               # a file (WAV, MP3, M4A, FLAC, ...) or 16 kHz mono float samples
+    tts = dooms.TTS("models/kokoro/Kokoro-82M/dooms")
+    dooms.save_wav("hello.wav", tts.speak("Hello world.", voice="af_heart"), tts.sample_rate)   # English text via misaki; tts.synthesize(phonemes, ...)
 
 Images are numpy arrays (or anything numpy can convert, e.g. a PIL image) of shape (height, width, 3), dtype uint8, RGB. Handles are not thread-safe; close() them
 (or use `with`) to release the models. The shared library is found through $DOOMS_LIB, next to this package, or in <repo>/build.
@@ -27,7 +29,7 @@ import numpy as np
 
 from . import _lib
 
-__all__ = ["DoomsError", "Generation", "LLM", "VLM", "VLA", "VLARunner", "RunnerStats", "Whisper", "WhisperTimings", "aggregate_weight", "version"]
+__all__ = ["DoomsError", "Generation", "LLM", "VLM", "VLA", "VLARunner", "RunnerStats", "Whisper", "WhisperTimings", "TTS", "TTSTimings", "save_wav", "aggregate_weight", "version"]
 
 _lib_handle = None
 
@@ -452,6 +454,132 @@ class Whisper(_Handle):
         t = _lib.WhisperTimings(ctypes.sizeof(_lib.WhisperTimings))
         _check(_library().dooms_whisper_last_timings(self._h, ctypes.byref(t)))
         return WhisperTimings(t.features_ms, t.encoder_ms, t.decode_ms, t.total_ms, t.audio_s, int(t.windows), int(t.tokens))
+
+
+@dataclass(frozen=True)
+class TTSTimings:
+    """Wall time of the last synthesis per stage and in all. rtf = total time / audio duration (below 1: faster than real time)."""
+    prosody_ms: float
+    f0n_ms: float
+    source_ms: float
+    vocoder_ms: float
+    istft_ms: float
+    total_ms: float
+    audio_s: float
+    tokens: int
+    frames: int
+
+    @property
+    def rtf(self) -> float:
+        return self.total_ms / 1000.0 / self.audio_s if self.audio_s > 0 else 0.0
+
+
+def save_wav(path, samples, sample_rate: int) -> None:
+    """Mono float samples in [-1, 1] -> 16-bit PCM WAV."""
+    import wave  # noqa: PLC0415
+    a = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+    with wave.open(os.fspath(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(int(sample_rate))
+        w.writeframes((a * 32767.0).round().astype("<i2").tobytes())
+
+
+class TTS(_Handle):
+    """Text to speech with Kokoro-82M: prosody on Core ML, the vocoder on the engine's own Metal kernels; 24 kHz mono.
+
+        tts = dooms.TTS("models/kokoro/Kokoro-82M/dooms")     # prosody-fp32.mlpackage, f0n-fp32.mlpackage, kokoro.gguf from tools/convert/convert_kokoro.py
+        audio = tts.speak("Hello world.", voice="af_heart")      # English text -> phonemes with misaki (pip install "misaki[en]"), long text in sentences
+        audio = tts.synthesize("həlˈO wˈɜɹld.", voice="af_heart", speed=1.0, seed=0)   # phonemes directly
+        tts.voices, tts.last_timings.rtf
+
+    The same seed gives the same samples (the vocoder's sine source draws its noise from it)."""
+    _close = "dooms_tts_close"
+
+    def __init__(self, model_dir=None, *, prosody=None, f0n=None, model=None, units: Optional[str] = None):
+        super().__init__()
+        self._require("dooms_tts_open")
+        if model_dir is not None:
+            prosody = prosody or os.path.join(model_dir, "prosody-fp32.mlpackage")
+            f0n = f0n or os.path.join(model_dir, "f0n-fp32.mlpackage")
+            model = model or os.path.join(model_dir, "kokoro.gguf")
+        if not (prosody and f0n and model):
+            raise ValueError("pass the model directory, or prosody=, f0n= and model=")
+        paths = _lib.TtsPaths(ctypes.sizeof(_lib.TtsPaths), _b(prosody), _b(f0n), _b(model))
+        opts = _lib.TtsOptions(ctypes.sizeof(_lib.TtsOptions), _b(units))
+        _check(_library().dooms_tts_open(ctypes.byref(paths), ctypes.byref(opts), ctypes.byref(self._h)))
+        self._g2p = {}
+
+    _require = staticmethod(LLM._require)
+
+    @property
+    def sample_rate(self) -> int:
+        self._require_open()
+        return int(_library().dooms_tts_sample_rate(self._h))
+
+    @property
+    def max_phonemes(self) -> int:
+        self._require_open()
+        return int(_library().dooms_tts_max_phonemes(self._h))
+
+    @property
+    def voices(self) -> List[str]:
+        self._require_open()
+        lib = _library()
+        return [lib.dooms_tts_voice_name(self._h, i).decode() for i in range(lib.dooms_tts_voice_count(self._h))]
+
+    def synthesize(self, phonemes: str, voice: str = "af_heart", speed: float = 1.0, seed: int = 0) -> np.ndarray:
+        """Phonemes (misaki's symbols) -> float32 samples at sample_rate."""
+        self._require_open()
+        lib = _library()
+        capacity = 24000 * 30
+        buf = np.empty(capacity, dtype=np.float32)
+        needed = ctypes.c_size_t()
+        code = lib.dooms_tts_synthesize(self._h, phonemes.encode(), voice.encode(), float(speed), int(seed),
+                                        buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), capacity, ctypes.byref(needed))
+        if code == 5 and needed.value > capacity:   # longer than the first buffer: fetch the kept result
+            buf = np.empty(needed.value, dtype=np.float32)
+            code = lib.dooms_tts_last_audio(self._h, buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), needed.value, None)
+        _check(code)
+        return buf[:needed.value].copy()
+
+    def phonemize(self, text: str, voice: str = "af_heart") -> str:
+        """English text -> phonemes with misaki (Kokoro's own G2P; British English for the b* voices)."""
+        british = voice[:1] == "b"
+        if british not in self._g2p:
+            try:
+                from misaki import en  # noqa: PLC0415
+            except ImportError as e:
+                raise ImportError('phonemizing text needs misaki: pip install "misaki[en]" (or pass phonemes to synthesize())') from e
+            self._g2p[british] = en.G2P(trf=False, british=british, fallback=None, unk="")
+        phonemes, _ = self._g2p[british](text)
+        return phonemes
+
+    def speak(self, text: str, voice: str = "af_heart", speed: float = 1.0, seed: int = 0) -> np.ndarray:
+        """English text -> samples. Text longer than max_phonemes is synthesized sentence by sentence (or in word groups) and concatenated."""
+        import re  # noqa: PLC0415
+        out = []
+        for sentence in [s for s in re.split(r"(?<=[.!?;:])\s+", text.strip()) if s]:
+            ph = self.phonemize(sentence, voice)
+            if len(ph) > self.max_phonemes:   # a very long sentence: words in groups that fit
+                words, group = ph.split(" "), ""
+                for w in words:
+                    if group and len(group) + 1 + len(w) > self.max_phonemes:
+                        out.append(self.synthesize(group, voice, speed, seed))
+                        group = ""
+                    group = (group + " " + w).strip()
+                if group:
+                    out.append(self.synthesize(group, voice, speed, seed))
+            elif ph.strip():
+                out.append(self.synthesize(ph, voice, speed, seed))
+        return np.concatenate(out) if out else np.zeros(0, dtype=np.float32)
+
+    @property
+    def last_timings(self) -> TTSTimings:
+        self._require_open()
+        t = _lib.TtsTimings(ctypes.sizeof(_lib.TtsTimings))
+        _check(_library().dooms_tts_last_timings(self._h, ctypes.byref(t)))
+        return TTSTimings(t.prosody_ms, t.f0n_ms, t.source_ms, t.vocoder_ms, t.istft_ms, t.total_ms, t.audio_s, int(t.tokens), int(t.frames))
 
 
 class VLA(_Handle):

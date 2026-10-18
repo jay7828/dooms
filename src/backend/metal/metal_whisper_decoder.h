@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "backend/metal/metal_llama_decoder.h"   // WeightRef
@@ -26,6 +28,10 @@ struct WhisperDecoderConfig {
     int32_t n_audio_ctx = 0;  // encoder positions per window (1500)
     float ln_eps = 0.f;
     bool spin_wait = true;    // as LlamaDecoderConfig::spin_wait
+    int32_t cross_splits = 0;        // cross-attention: groups of audio positions run as separate threadgroups (0: about 64 threadgroups per token)
+    // LayerNorm of a decode step's input: 1 inside every threadgroup of the projection that follows, 0 one layernorm dispatch first, -1 automatic (folded in for
+    // rows up to 512 wide: measured faster for whisper-tiny's 384, slower for turbo's 1280; src/backend/metal/CLAUDE.md).
+    int32_t fused_layernorm = -1;
 };
 
 struct WhisperLayerWeights {
@@ -65,11 +71,18 @@ public:
     //   InvalidArgument  a token outside the vocabulary     ResourceExhausted  the text context is full
     Status eval_token(int32_t token, bool first_step);
 
+    // The prompt of a window: every token appended, the last one's greedy successor is the first generated token (eval_token over the tokens, with first_step on
+    // the last). Up to 8 tokens per pass, each weight read once for all of them; the results equal that loop's to rounding.   InvalidArgument  empty, or a token outside the vocabulary     ResourceExhausted  the text context would overflow
+    Status eval_prompt(const std::vector<int32_t> & tokens);
+
     Result<int32_t> pending_token();              // the masked greedy successor of the last evaluated token
     Result<std::vector<float>> logits();          // raw logits of the last evaluated position (before the mask), for parity checks
 
     // Greedy generation from the pending token, steps queued on the GPU like MetalLlamaDecoder::generate (same semantics; the always-mask applies).
     Status generate(int32_t max_tokens, int32_t depth, const std::function<bool(int32_t)> & on_token);
+
+    // One decode step after the pending token with every dispatch in its own command buffer: (kernel kind, GPU ms) in dispatch order. For bench_whisper --profile.
+    Result<std::vector<std::pair<std::string, double>>> profile_step();
 
 private:
     struct Impl;

@@ -104,6 +104,45 @@ class Whisper(unittest.TestCase):
         self.assertEqual(cm.exception.code, "InvalidArgument")
 
 
+TTS_DIR = os.path.join(MODELS, "kokoro", "Kokoro-82M", "dooms")
+
+
+class Tts(unittest.TestCase):
+    def test_arguments(self):
+        with self.assertRaises(ValueError):
+            dooms.TTS()
+        with self.assertRaises(dooms.DoomsError) as cm:
+            dooms.TTS("/nonexistent")
+        self.assertEqual(cm.exception.code, "NotFound")
+
+    @unittest.skipUnless(os.path.exists(os.path.join(TTS_DIR, "kokoro.gguf")), "Kokoro (tools/convert/convert_kokoro.py) not available")
+    def test_synthesize_and_save(self):
+        import tempfile  # noqa: PLC0415
+        import wave  # noqa: PLC0415
+        with dooms.TTS(TTS_DIR) as tts:
+            self.assertEqual(tts.sample_rate, 24000)
+            self.assertIn("af_heart", tts.voices)
+            ph = "h\u0259l\u02c8O w\u02c8\u025c\u0279ld."
+            a = tts.synthesize(ph, "af_heart", seed=3)
+            self.assertEqual(a.dtype, np.float32)
+            self.assertTrue(np.array_equal(a, tts.synthesize(ph, "af_heart", seed=3)))   # seeded: reproducible
+            self.assertEqual(len(a) % 600, 0)
+            self.assertGreater(float(np.abs(a).max()), 0.01)
+            t = tts.last_timings
+            self.assertEqual(t.frames * 600, len(a))
+            self.assertAlmostEqual(t.rtf, t.total_ms / 1000 / t.audio_s)
+            long_ph = " ".join([ph] * 60)[: tts.max_phonemes]                  # more samples than the first buffer: the kept-result path
+            self.assertGreater(len(tts.synthesize(long_ph, "af_heart")), 24000 * 30)
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "x.wav")
+                dooms.save_wav(path, a, tts.sample_rate)
+                with wave.open(path) as w:
+                    self.assertEqual((w.getframerate(), w.getnchannels(), w.getnframes()), (24000, 1, len(a)))
+            with self.assertRaises(dooms.DoomsError) as cm:
+                tts.synthesize(ph, "nobody")
+            self.assertEqual(cm.exception.code, "InvalidArgument")
+
+
 class ErrorPaths(unittest.TestCase):
     def test_version(self):
         self.assertRegex(dooms.version(), r"^\d+\.\d+\.\d+$")

@@ -4,6 +4,7 @@
 #import <Foundation/Foundation.h>
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <map>
 
@@ -42,7 +43,7 @@ Status read_port(MLFeatureDescription * d, Port * out) {
     if (d.type != MLFeatureTypeMultiArray) return invalid_argument("'" + name + "' is not a multi-array tensor");
     MLMultiArrayConstraint * c = d.multiArrayConstraint;
     if (c.shape.count == 0) {  // not declared: the shape follows the input (enumerated input shapes); every call is checked against the returned array
-        out->info = {name, Shape::create({1}).value(), {}, true};
+        out->info = {name, Shape::create({1}).value(), {}, true, {}};
         out->info.allowed.push_back(out->info.shape);
         switch (c.dataType) {
             case MLMultiArrayDataTypeFloat32: out->elem = Elem::F32; break;
@@ -61,8 +62,17 @@ Status read_port(MLFeatureDescription * d, Port * out) {
         case MLMultiArrayDataTypeFloat16: out->elem = Elem::F16; break;  // converted from / to the caller's float32
         default: return unsupported("'" + name + "' has an element type other than float32/float16");
     }
-    out->info = {name, shape.value(), {shape.value()}, false};
-    if (c.shapeConstraint.type == MLMultiArrayShapeConstraintTypeRange) return unsupported("'" + name + "' has a range shape constraint; only fixed or enumerated shapes are supported");
+    out->info = {name, shape.value(), {shape.value()}, false, {}};
+    if (c.shapeConstraint.type == MLMultiArrayShapeConstraintTypeRange) {
+        NSArray<NSValue *> * ranges = c.shapeConstraint.sizeRangeForDimension;
+        if (ranges.count != c.shape.count) return invalid_argument("'" + name + "' has a range constraint of a different rank");
+        for (NSValue * v : ranges) {
+            const NSRange r = v.rangeValue;
+            const int64_t lo = static_cast<int64_t>(r.location);
+            const int64_t hi = r.length >= static_cast<NSUInteger>(INT64_MAX) - r.location ? INT64_MAX : static_cast<int64_t>(r.location + r.length);
+            out->info.range.emplace_back(lo, hi);
+        }
+    }
     if (c.shapeConstraint.type == MLMultiArrayShapeConstraintTypeEnumerated) {
         out->info.allowed.clear();
         for (NSArray<NSNumber *> * dims_ns in c.shapeConstraint.enumeratedShapes) {
@@ -79,6 +89,14 @@ Status read_port(MLFeatureDescription * d, Port * out) {
 }
 
 }  // namespace
+
+bool CoreMlTensorInfo::accepts(const Shape & s) const {
+    if (s == shape) return true;
+    for (const Shape & a : allowed) if (s == a) return true;
+    if (range.empty() || s.rank() != static_cast<int>(range.size())) return false;
+    for (int i = 0; i < s.rank(); i++) if (s.dim(i) < range[static_cast<size_t>(i)].first || s.dim(i) > range[static_cast<size_t>(i)].second) return false;
+    return true;
+}
 
 Result<CoreMlUnits> parse_coreml_units(const std::string & name) {
     if (name == "all") return CoreMlUnits::All;
@@ -173,8 +191,7 @@ Status CoreMlModel::predict(const std::vector<NamedTensor> & inputs, const std::
                 if (t.tensor.dtype() != DType::F32 && t.tensor.dtype() != DType::F16) return invalid_argument(std::string(what) + " '" + t.name + "' must be float32 or float16");
                 // a float16 binding hands over the model's own element type without a conversion: only for ports the model declares as float16
                 if (t.tensor.dtype() == DType::F16 && port->elem != Elem::F16) return invalid_argument(std::string(what) + " '" + t.name + "' is bound as float16 but the model declares it as float32");
-                bool shape_ok = t.tensor.shape() == port->info.shape;
-                for (const Shape & s : port->info.allowed) shape_ok = shape_ok || t.tensor.shape() == s;
+                bool shape_ok = port->info.accepts(t.tensor.shape());
                 // outputs of a model with enumerated input shapes take shapes that depend on the input; Core ML's returned shape is checked below
                 if (!is_input && (flexible_input || port->info.shape_unknown)) shape_ok = port->info.shape_unknown || t.tensor.shape().rank() == port->info.shape.rank();
                 if (!shape_ok) {

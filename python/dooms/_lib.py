@@ -86,6 +86,19 @@ class WhisperTimings(ctypes.Structure):
                 ("audio_s", c_double), ("windows", c_int32), ("tokens", c_int32)]
 
 
+class TtsPaths(ctypes.Structure):
+    _fields_ = [("struct_size", c_size_t), ("prosody", c_char_p), ("f0n", c_char_p), ("model", c_char_p)]
+
+
+class TtsOptions(ctypes.Structure):
+    _fields_ = [("struct_size", c_size_t), ("units", c_char_p)]
+
+
+class TtsTimings(ctypes.Structure):
+    _fields_ = [("struct_size", c_size_t), ("prosody_ms", c_double), ("f0n_ms", c_double), ("source_ms", c_double), ("vocoder_ms", c_double), ("istft_ms", c_double),
+                ("total_ms", c_double), ("audio_s", c_double), ("tokens", c_int32), ("frames", c_int32)]
+
+
 def _candidates():
     env = os.environ.get("DOOMS_LIB")
     if env:
@@ -192,3 +205,19 @@ def _declare(lib):
         lib.dooms_whisper_last_text.argtypes = [c_void_p, ctypes.c_char_p, c_size_t, POINTER(c_size_t)]
         lib.dooms_whisper_last_timings.restype = code
         lib.dooms_whisper_last_timings.argtypes = [c_void_p, POINTER(WhisperTimings)]
+    # text to speech, appended to C API version 1 (TTS._require)
+    if hasattr(lib, "dooms_tts_open"):
+        lib.dooms_tts_open.restype = code
+        lib.dooms_tts_open.argtypes = [POINTER(TtsPaths), POINTER(TtsOptions), POINTER(c_void_p)]
+        lib.dooms_tts_close.argtypes = [c_void_p]
+        for name in ("dooms_tts_sample_rate", "dooms_tts_max_phonemes", "dooms_tts_voice_count"):
+            getattr(lib, name).restype = c_int32
+            getattr(lib, name).argtypes = [c_void_p]
+        lib.dooms_tts_voice_name.restype = c_char_p
+        lib.dooms_tts_voice_name.argtypes = [c_void_p, c_int32]
+        lib.dooms_tts_synthesize.restype = code
+        lib.dooms_tts_synthesize.argtypes = [c_void_p, c_char_p, c_char_p, c_float, c_uint64, POINTER(c_float), c_size_t, POINTER(c_size_t)]
+        lib.dooms_tts_last_audio.restype = code
+        lib.dooms_tts_last_audio.argtypes = [c_void_p, POINTER(c_float), c_size_t, POINTER(c_size_t)]
+        lib.dooms_tts_last_timings.restype = code
+        lib.dooms_tts_last_timings.argtypes = [c_void_p, POINTER(TtsTimings)]

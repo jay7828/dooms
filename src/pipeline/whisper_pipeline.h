@@ -30,6 +30,8 @@ struct WhisperOptions {
     int32_t max_tokens_per_window = 224;     // in [1, n_text_ctx / 2] (Whisper's own limit per 30-s window)
     int32_t queue_depth = 1;                 // decode steps queued on the GPU ahead of the token being read
     bool spin_wait = true;
+    int32_t cross_splits = 0;                // decoder tuning (WhisperDecoderConfig): 0 = automatic
+    int32_t fused_layernorm = -1;
 };
 
 struct WhisperTimings {

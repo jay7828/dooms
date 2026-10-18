@@ -2,7 +2,7 @@
 
     dooms pull qwen2.5-0.5b                                   # an alias of ALIASES: a GGUF from its publisher's own repository, pinned to a commit
     dooms pull hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf[@REVISION]
-    dooms pull smolvlm | smolvla | whisper-tiny | whisper-large-v3-turbo   # original weights + local conversion (source checkout only, see CONVERTED)
+    dooms pull smolvlm | smolvla | whisper-tiny | whisper-large-v3-turbo | kokoro   # original weights + local conversion (source checkout only, see CONVERTED)
 
 Every file is checked against the hash Hugging Face publishes for it (the SHA-256 of an LFS file, `lfs.oid` in the paths-info API; the git blob SHA-1 of a small
 file, `oid`). Downloads go to `<file>.part`, resume with an HTTP Range request, and are renamed into place only after the check; a mismatch deletes the partial file.
@@ -79,7 +79,11 @@ WHISPER: Dict[str, Tuple[Snapshot, float]] = {
     "whisper-tiny": (Snapshot("openai/whisper-tiny", "169d4a4341b33bc18d8881c4b69c2e104e1cc0af", _WHISPER_SKIP), 2e-2),
     "whisper-large-v3-turbo": (Snapshot("openai/whisper-large-v3-turbo", "41f01f3fe87f28c78e2fbf8b568835947dd65ed9", _WHISPER_SKIP), 3e-2),
 }
-CONVERTED = ("smolvlm", "smolvla") + tuple(WHISPER)
+# Kokoro-82M (Apache-2.0): the voices are part of the snapshot; its evaluation images and samples are not read. Converted by tools/convert/convert_kokoro.py in an
+# environment with the reference package (kokoro 0.9.4: the converter checks every output against it).
+KOKORO = Snapshot("hexgrad/Kokoro-82M", "f3ff3571791e39611d31c381e3a41a3af07b4987", ("eval/", "samples/"))
+KOKORO_MODULES = ("torch", "kokoro", "coremltools", "gguf")
+CONVERTED = ("smolvlm", "smolvla") + tuple(WHISPER) + ("kokoro",)
 CONVERT_MODULES = ("torch", "coremltools", "transformers", "gguf", "safetensors", "huggingface_hub")   # what tools/convert imports
 LEROBOT_MODULES = ("torch", "lerobot")                                                                  # tools/parity/smolvla_reference.py
 
@@ -390,11 +394,13 @@ def _how_to_convert(name: str, problem: str) -> PullError:
         f"{name} runs from Core ML packages and GGUF files that are converted locally from the original weights (the converted files are never redistributed, "
         "docs/adr/0002). To convert:\n"
         "  1. git clone https://github.com/jay7828/dooms && cd dooms && build it (README: cmake -B build ... && cmake --build build)\n"
-        "  2. python3 -m venv .venv && .venv/bin/pip install torch coremltools transformers gguf safetensors huggingface_hub numpy pillow\n"
+        + ("  2. python3.11 -m venv .venv-kokoro && .venv-kokoro/bin/pip install kokoro==0.9.4 'misaki[en]' torch==2.8.0 coremltools==9.0 gguf\n"
+           if name == "kokoro" else
+           "  2. python3 -m venv .venv && .venv/bin/pip install torch coremltools transformers gguf safetensors huggingface_hub numpy pillow\n")
         + ("  3. a second environment with LeRobot for the reference observation: python3 -m venv .venv-lerobot && .venv-lerobot/bin/pip install 'lerobot[smolvla]'\n"
            if name == "smolvla" else "")
         + f"  then, in the checkout: .venv/bin/python -m dooms pull {name}   (run from python/, or set PYTHONPATH=python; DOOMS_SOURCE_DIR, DOOMS_CONVERT_PYTHON, "
-        "DOOMS_LEROBOT_PYTHON and DOOMS_LLAMA_CPP_DIR override the defaults)")
+        "DOOMS_LEROBOT_PYTHON, DOOMS_KOKORO_PYTHON and DOOMS_LLAMA_CPP_DIR override the defaults)")
 
 
 def _python_with(env_var: str, default: str, modules: Sequence[str], name: str, purpose: str) -> str:
@@ -427,7 +433,12 @@ def _check_loads(name: str, out_dir: str) -> None:
 
     import dooms  # noqa: PLC0415
 
-    if name in WHISPER:
+    if name == "kokoro":
+        with dooms.TTS(out_dir) as tts:
+            audio = tts.synthesize("h\u0259l\u02c8O", tts.voices[0])
+            seconds, voices = len(audio) / tts.sample_rate, len(tts.voices)
+        print(f"{out_dir}: loads and speaks ({seconds:.2f} s for a word, {voices} voices)", file=sys.stderr)
+    elif name in WHISPER:
         with dooms.Whisper(out_dir) as stt:
             text = stt.transcribe(np.zeros(stt.sample_rate, dtype=np.float32))
         print(f"{out_dir}: loads and transcribes one second of silence ({text!r})", file=sys.stderr)
@@ -445,8 +456,11 @@ def pull_converted(name: str, target_dir: str, progress: Optional[Progress] = st
     root = source_dir()
     if root is None:
         raise _how_to_convert(name, "this installation has no converters (tools/convert is part of the source checkout, not of the wheel)")
-    convert_py = _python_with("DOOMS_CONVERT_PYTHON", os.path.join(root, ".venv", "bin", "python"), CONVERT_MODULES, name, "the converters")
-    llama_cpp = None if name in WHISPER else _llama_cpp_dir(root, name)
+    if name == "kokoro":
+        convert_py = _python_with("DOOMS_KOKORO_PYTHON", os.path.join(root, ".venv-kokoro", "bin", "python"), KOKORO_MODULES, name, "the Kokoro converter")
+    else:
+        convert_py = _python_with("DOOMS_CONVERT_PYTHON", os.path.join(root, ".venv", "bin", "python"), CONVERT_MODULES, name, "the converters")
+    llama_cpp = None if (name in WHISPER or name == "kokoro") else _llama_cpp_dir(root, name)
     lerobot_py = None
     if name == "smolvla":
         lerobot_py = _python_with("DOOMS_LEROBOT_PYTHON", os.path.join(root, ".venv-lerobot", "bin", "python"), LEROBOT_MODULES, name, "the LeRobot reference")
@@ -454,7 +468,10 @@ def pull_converted(name: str, target_dir: str, progress: Optional[Progress] = st
     tmp = out + ".converting"
     os.makedirs(tmp, exist_ok=True)
     conv = lambda script: os.path.join(root, "tools", "convert", script)  # noqa: E731
-    if name in WHISPER:
+    if name == "kokoro":
+        model = pull_snapshot(KOKORO, target_dir, progress)
+        _run([convert_py, conv("convert_kokoro.py"), "--model", model, "--out-dir", tmp], root)
+    elif name in WHISPER:
         snapshot, max_rel_l2 = WHISPER[name]
         model = pull_snapshot(snapshot, target_dir, progress)
         _run([convert_py, conv("convert_whisper.py"), "--model", model, "--out-dir", tmp, "--encoder-max-rel-l2", str(max_rel_l2)], root)
@@ -480,7 +497,7 @@ def pull_converted(name: str, target_dir: str, progress: Optional[Progress] = st
         print(f"the previous {out} was kept as {backup}", file=sys.stderr)
     else:
         os.replace(tmp, out)
-    opener = "dooms.Whisper" if name in WHISPER else f"dooms.{'VLM' if name == 'smolvlm' else 'VLA'}.from_dir"
+    opener = "dooms.TTS" if name == "kokoro" else "dooms.Whisper" if name in WHISPER else f"dooms.{'VLM' if name == 'smolvlm' else 'VLA'}.from_dir"
     print(f"{out}: converted and verified (open it with {opener})", file=sys.stderr)
     return out
 

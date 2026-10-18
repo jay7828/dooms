@@ -2,12 +2,13 @@
 // Models: bench/reports/2026-10-15-all-models/report.md (3 interleaved rounds, AC power, Low Power Mode off, load 1.3-1.5).
 // SmolVLM decode and time to first token: bench/BASELINES.md "Own decoder for text LLMs too" (decode_shootout.sh, 3 interleaved rounds, the engine's own
 // Metal decoder). LLM: bench/reports/2026-10-15-llm-metal/report.md (run_llm.py, 2 interleaved rounds).
-// Speech: bench/BASELINES.md "Speech to text" (bench/reports/2026-10-17-speech, two runs, lower median per configuration).
+// Speech: bench/BASELINES.md "Speech to text" (dooms.cpp, MLX, whisper.cpp: bench/reports/2026-10-18-speech after the decoder optimizations; PyTorch and Sapient:
+// bench/reports/2026-10-17-speech). Lower median of two rounds per configuration.
 // Machine: Apple M1 Pro (6 performance + 2 efficiency cores, 14-core GPU, 16 GB), macOS 26.6.
 
 window.DOOMS = {
   machine: "Apple M1 Pro, 16 GB, macOS 26.6",
-  measured: "15 and 17 October 2026",
+  measured: "15 to 18 October 2026",
 
   systems: {
     dooms: { label: "dooms.cpp", slot: 1 },
@@ -16,6 +17,7 @@ window.DOOMS = {
     llama: { label: "llama.cpp", slot: 4 },
     whispercpp: { label: "whisper.cpp", slot: 4 },
     sapient: { label: "Sapient", slot: 4 },
+    onnx: { label: "ONNX Runtime", slot: 4 },
   },
 
   // SmolVLA: three cameras + prompt + robot state -> a 50-step action chunk (10 flow-matching steps)
@@ -86,27 +88,36 @@ window.DOOMS = {
   // Whisper speech to text: the 73 LibriSpeech clips (481 s of audio, one call per clip) and the same audio as one 8-minute file, greedy, f16; seconds for all of it
   speech: {
     turboClips: [
-      { sys: "mlx", name: "MLX-Whisper fp16", s: 53.90 },
-      { sys: "dooms", name: "dooms.cpp, own Metal decoder", s: 54.84 },
-      { sys: "whispercpp", name: "whisper.cpp, Metal", s: 64.52 },
+      { sys: "dooms", name: "dooms.cpp, own Metal decoder", s: 53.61 },
+      { sys: "mlx", name: "MLX-Whisper fp16", s: 53.62 },
+      { sys: "whispercpp", name: "whisper.cpp, Metal", s: 63.77 },
       { sys: "pytorch", name: "PyTorch MPS fp16", s: 104.97 },
       { sys: "sapient", name: "Sapient, Metal", s: 948.44 },
     ],
     turboLong: [
-      { sys: "dooms", name: "dooms.cpp, own Metal decoder", s: 16.15 },
-      { sys: "mlx", name: "MLX-Whisper fp16", s: 16.32 },
-      { sys: "whispercpp", name: "whisper.cpp, Metal (one window loops)", s: 23.23 },
+      { sys: "dooms", name: "dooms.cpp, own Metal decoder", s: 15.48 },
+      { sys: "mlx", name: "MLX-Whisper fp16", s: 15.48 },
+      { sys: "whispercpp", name: "whisper.cpp, Metal (one window loops)", s: 21.88 },
       { sys: "pytorch", name: "PyTorch MPS fp16", s: 41.91 },
       { sys: "sapient", name: "Sapient, Metal", s: 241.16 },
     ],
     tinyClips: [
-      { sys: "mlx", name: "MLX-Whisper fp16", s: 3.08 },
-      { sys: "dooms", name: "dooms.cpp, own Metal decoder", s: 3.24 },
-      { sys: "whispercpp", name: "whisper.cpp, Metal", s: 5.44 },
+      { sys: "dooms", name: "dooms.cpp, own Metal decoder", s: 2.81 },
+      { sys: "mlx", name: "MLX-Whisper fp16", s: 3.03 },
+      { sys: "whispercpp", name: "whisper.cpp, Metal", s: 5.05 },
       { sys: "pytorch", name: "PyTorch MPS fp16", s: 15.12 },
       { sys: "sapient", name: "Sapient, Metal", s: 68.57 },
     ],
   },
+
+  // Kokoro-82M text to speech: 73 sentences (404 s of speech), same phonemes and voice for every engine; seconds for all of them (bench/reports/2026-10-18-tts)
+  tts: [
+    { sys: "dooms", name: "dooms.cpp, own Metal vocoder", s: 15.08 },
+    { sys: "mlx", name: "MLX fp32 (mlx-audio)", s: 23.45 },
+    { sys: "pytorch", name: "PyTorch MPS fp32", s: 33.27 },
+    { sys: "pytorch", name: "PyTorch CPU fp32", s: 46.66 },
+    { sys: "onnx", name: "ONNX Runtime CPU fp32", s: 85.96 },
+  ],
 
   // A 631M-parameter ViT backbone (1280 wide, 32 blocks), one forward on the GPU only
   vit: [

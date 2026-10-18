@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "backend/backend.h"
@@ -29,8 +30,10 @@ struct CoreMlTensorInfo {
     std::string name;
     Shape shape;                  // the declared (default) shape
     std::vector<Shape> allowed;   // an input declared with enumerated shapes lists them all (including `shape`); otherwise just `shape`
-    bool flexible() const { return allowed.size() > 1; }
+    bool flexible() const { return allowed.size() > 1 || !range.empty(); }
+    bool accepts(const Shape & s) const;              // `shape`, one of `allowed`, or within `range`
     bool shape_unknown = false;   // an output whose shape Core ML does not declare (models with enumerated input shapes); `shape` is then a placeholder
+    std::vector<std::pair<int64_t, int64_t>> range;   // an input declared with a range constraint: [min, max] per dimension (any shape within); empty otherwise
 };
 
 class CoreMlModel {
@@ -49,7 +52,7 @@ public:
     const std::vector<CoreMlTensorInfo> & outputs() const;
 
     // inputs/outputs must cover the model's inputs/outputs exactly once, as contiguous float32 host tensors. Shapes must be the declared ones; an input
-    // with enumerated shapes may take any of them, and then the outputs take the shapes the model produces for it (checked against what Core ML returns).
+    // with enumerated shapes may take any of them (with a range constraint, any shape within it), and then the outputs take the shapes the model produces for it (checked against what Core ML returns).
     // Not thread-safe. InvalidArgument for a binding that does not match; Internal if Core ML fails.
     Status predict(const std::vector<NamedTensor> & inputs, const std::vector<NamedTensor> & outputs);
 

@@ -483,13 +483,13 @@ kernel void rope_store(device float * qkv [[buffer(0)]], device half * kc [[buff
     device float * row = qkv + t * p.qkv_stride;
     if (slot < p.n_head) {
         device float * x = row + slot * hd;
-        const float2 r = rotate_pair(float2(x[e.x], x[e.y]), i, hd, pos, p.base);
+        const float2 r = rotate_pair(float2(x[e.x], x[e.y]), i, hd, pos, p.base, p.neox);
         x[e.x] = r.x;
         x[e.y] = r.y;
     } else if (slot < p.n_head + p.n_head_kv) {
         const uint kvh = slot - p.n_head;
         device const float * x = row + (p.n_head + kvh) * hd;
-        const float2 r = rotate_pair(float2(x[e.x], x[e.y]), i, hd, pos, p.base);
+        const float2 r = rotate_pair(float2(x[e.x], x[e.y]), i, hd, pos, p.base, p.neox);
         device half * dst = kc + (ulong)pos * p.kv_stride + kvh * hd;
         dst[e.x] = half(r.x);
         dst[e.y] = half(r.y);
@@ -716,6 +716,158 @@ template [[host_name("attention_prefill_128")]] kernel void attention_prefill<12
 // Float to half (the cross-attention keys and values of an audio window, computed once into a float scratch by matmul_big).
 kernel void to_half(device const float * src [[buffer(0)]], device half * dst [[buffer(1)]], constant uint & n [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i < n) dst[i] = half(src[i]);
+}
+
+// ---- Whisper: LayerNorm once per site, several prompt tokens per weight read, cross-attention split over the audio positions ----
+
+constant constexpr uint kMaxBatch = 8;   // tokens per matvecm call
+
+// y[row] = LayerNorm(x[row]) * gamma + beta for row = threadgroup index (rows of K floats). One threadgroup of kGroupThreads per row, two passes (mean, variance).
+kernel void layernorm(device const float * x [[buffer(0)]], device float * y [[buffer(1)]], device const float * gamma [[buffer(2)]],
+                      device const float * beta [[buffer(3)]], constant MatvecParams & p [[buffer(4)]], uint row [[threadgroup_position_in_grid]],
+                      uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red[kSimdgroupsPerGroup];
+    device const float * xr = x + (ulong)row * p.K;
+    device float * yr = y + (ulong)row * p.K;
+    float s = 0.f;
+    for (uint k = tid; k < p.K; k += kGroupThreads) s += xr[k];
+    s = simd_sum(s);
+    if (lane == 0) red[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = 0.f;
+    for (uint i = 0; i < kSimdgroupsPerGroup; i++) mean += red[i];
+    mean /= float(p.K);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float v = 0.f;
+    for (uint k = tid; k < p.K; k += kGroupThreads) { const float d = xr[k] - mean; v += d * d; }
+    v = simd_sum(v);
+    if (lane == 0) red[sg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float var = 0.f;
+    for (uint i = 0; i < kSimdgroupsPerGroup; i++) var += red[i];
+    const float inv = rsqrt(var / float(p.K) + p.eps);
+    for (uint k = tid; k < p.K; k += kGroupThreads) yr[k] = (xr[k] - mean) * inv * gamma[k] + beta[k];
+}
+
+// Y[m][r] (+)= W[r] . X[m] (+ bias[r], GELU) for m < M <= kMaxBatch: each weight row is read once for all M tokens (the prompt of a window). X rows (stride K)
+// come from device memory; flags as matvec1 bits 1, 2 and 4 (no normalization: run layernorm first). kDecodeRowsPerSimdgroup rows per simdgroup.
+kernel void matvecm(device const half * W [[buffer(0)]], device const float * X [[buffer(1)]], device float * Y [[buffer(2)]],
+                    constant MatvecParams & p [[buffer(4)]], device const float * bias [[buffer(5)]], constant uint & M [[buffer(6)]],
+                    uint gid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint R = kDecodeRowsPerSimdgroup;
+    const uint row0 = (gid * kSimdgroupsPerGroup + sg) * R;
+    if (row0 >= p.N) return;
+    const uint K4 = p.K / 4;
+    float acc[R][kMaxBatch];
+    for (uint i = 0; i < R; i++) for (uint m = 0; m < kMaxBatch; m++) acc[i][m] = 0.f;
+    device const half4 * w[R];
+    for (uint i = 0; i < R; i++) w[i] = (device const half4 *)(W + (ulong)min(row0 + i, p.N - 1) * p.K);
+    for (uint k4 = lane; k4 < K4; k4 += 32) {
+        float4 wv[R];
+        for (uint i = 0; i < R; i++) wv[i] = float4(w[i][k4]);
+        for (uint m = 0; m < kMaxBatch; m++) {
+            if (m < M) {
+                const float4 xv = ((device const float4 *)(X + (ulong)m * p.K))[k4];
+                for (uint i = 0; i < R; i++) acc[i][m] += dot(wv[i], xv);
+            }
+        }
+    }
+    for (uint i = 0; i < R; i++) {
+        const uint r = row0 + i;
+        for (uint m = 0; m < kMaxBatch; m++) {
+            if (m >= M) break;
+            float s = simd_sum(acc[i][m]) + ((p.flags & 4u) && r < p.N ? bias[r] : 0.f);
+            if (p.flags & 16u) s = gelu_erf(s);
+            if (lane == 0 && r < p.N) {
+                const ulong o = (ulong)m * p.N + r;
+                Y[o] = (p.flags & 2u) ? Y[o] + s : s;
+            }
+        }
+    }
+}
+
+struct SplitParams {
+    uint n_head, head_dim;
+    uint q_stride;    // floats between query tokens
+    uint kv_stride;   // halfs between key (value) positions
+    uint n_keys;      // positions attended (all of them: no causal mask)
+    uint chunk;       // positions per split
+    uint n_split;
+    uint out_stride;  // floats between output tokens
+    float scale;
+};
+
+// Attention without a causal mask over many keys (Whisper's cross-attention: 1500 audio positions), split over the positions so that every core has work:
+// threadgroup (head, split, query token) scores its chunk, and writes (max, sum of exp, 2 unused, unnormalized value sum) to part (4 + head_dim floats per
+// entry); attention_combine merges the splits. The query is pre-scaled here. head_dim 64 or 128 (the host checks).
+kernel void attention_split(device const float * q [[buffer(0)]], device const half * kc [[buffer(1)]], device const half * vc [[buffer(2)]],
+                            device float * part [[buffer(3)]], constant SplitParams & p [[buffer(4)]], threadgroup float * scores [[threadgroup(0)]],
+                            uint3 g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red[kAttnSimdgroups];
+    threadgroup float4 qs4[kMaxHeadDim / 4];
+    threadgroup float4 partial4[kAttnThreads];
+    const uint h = g.x, s = g.y, t = g.z, hd = p.head_dim, hd4 = hd / 4;
+    const uint j0 = s * p.chunk, j1 = min(j0 + p.chunk, p.n_keys), n = j1 > j0 ? j1 - j0 : 0;
+    device const float4 * qrow = (device const float4 *)(q + (ulong)t * p.q_stride + h * hd);
+    for (uint i = tid; i < hd4; i += kAttnThreads) qs4[i] = qrow[i] * p.scale;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mx = -INFINITY;
+    for (uint j = tid; j < n; j += kAttnThreads) {
+        device const half4 * k = (device const half4 *)(kc + (ulong)(j0 + j) * p.kv_stride + h * hd);
+        float sc = 0.f;
+        for (uint i = 0; i < hd4; i++) sc += dot(qs4[i], float4(k[i]));
+        scores[j] = sc;
+        mx = max(mx, sc);
+    }
+    mx = simd_max(mx);
+    if (lane == 0) red[sg] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx = red[0];
+    for (uint i = 1; i < kAttnSimdgroups; i++) mx = max(mx, red[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = 0.f;
+    for (uint j = tid; j < n; j += kAttnThreads) {
+        const float e = exp(scores[j] - mx);
+        scores[j] = e;
+        sum += e;
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) red[sg] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum = 0.f;
+    for (uint i = 0; i < kAttnSimdgroups; i++) sum += red[i];
+    const uint groups = kAttnThreads / hd4, pg = tid / hd4, d4 = tid % hd4;
+    float4 acc = 0.f;
+    for (uint j = pg; j < n; j += groups) acc += scores[j] * float4(((device const half4 *)(vc + (ulong)(j0 + j) * p.kv_stride + h * hd))[d4]);
+    partial4[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device float * out = part + ((ulong)(t * p.n_head + h) * p.n_split + s) * (4 + hd);   // (max, sum, -, -, values): 16-byte aligned
+    if (tid < hd4) {
+        float4 total = 0.f;
+        for (uint i = 0; i < groups; i++) total += partial4[i * hd4 + tid];
+        ((device float4 *)(out + 4))[tid] = total;
+    }
+    if (tid == 0) { out[0] = mx; out[1] = sum; }
+}
+
+// out[t][h] = merge of the n_split partial results of (head h, token t): rescale each by exp(max_s - max), divide by the total sum. One threadgroup per
+// (head, token), head_dim threads.
+kernel void attention_combine(device const float * part [[buffer(0)]], device float * out [[buffer(1)]], constant SplitParams & p [[buffer(2)]],
+                              uint2 g [[threadgroup_position_in_grid]], uint i [[thread_index_in_threadgroup]]) {
+    const uint h = g.x, t = g.y, hd = p.head_dim;
+    device const float * base = part + (ulong)(t * p.n_head + h) * p.n_split * (4 + hd);
+    float mx = -INFINITY;
+    for (uint s = 0; s < p.n_split; s++) if (base[s * (4 + hd) + 1] > 0.f) mx = max(mx, base[s * (4 + hd)]);
+    float total = 0.f, acc = 0.f;
+    for (uint s = 0; s < p.n_split; s++) {
+        device const float * ps = base + s * (4 + hd);
+        if (!(ps[1] > 0.f)) continue;   // an empty split
+        const float w = exp(ps[0] - mx);
+        total += ps[1] * w;
+        acc += ps[4 + i] * w;
+    }
+    if (i < hd) out[(ulong)t * p.out_stride + h * hd + i] = acc / total;
 }
 
 // ---- Tokens ----

@@ -178,6 +178,11 @@ TEST(suppression_masks_apply) {
     run_prompt();
     const int32_t first2 = dec.pending_token().value();
     EXPECT(first2 != a && first2 == host_argmax(l1, join(always, begin)));
+    // the batched prompt applies the begin list the same way
+    EXPECT(dec.set_audio(states.data()).is_ok());
+    EXPECT(dec.eval_prompt(pr).is_ok());
+    EXPECT(dec.pending_token().value() == first2);
+    run_prompt();
     EXPECT(dec.eval_token(first, false).is_ok());
     const int32_t second2 = dec.pending_token().value();
     EXPECT(second2 != c && second2 == host_argmax(l2, always));
@@ -207,6 +212,72 @@ TEST(suppression_masks_apply) {
     }
     EXPECT(same);
     EXPECT(std::find(h.begin(), h.end(), g[3]) == h.end() && h != g);
+}
+
+// eval_prompt (several tokens per pass, a pass per 8 tokens) must equal the eval_token loop, and every decoder tuning (cross-attention splits incl. uneven and
+// empty last splits, LayerNorm folded in or separate) the default, on transformers' own encoder states.
+TEST(prompt_batches_and_tunings_match_single_steps) {
+    const std::string d = dir();
+    if (d.empty()) { std::printf("        (skipped: set DOOMS_WHISPER_DIR)\n"); return; }
+    auto ref = GgufFile::open(d + "/reference.gguf");
+    EXPECT(ref.is_ok());
+    if (!ref.is_ok()) return;
+    const std::vector<float> states = tensor(ref.value(), "case0.encoder_out");
+    const std::vector<int32_t> generated = ints(tensor(ref.value(), "case0.generated"));
+    // logits and greedy successor after `tokens`, one token per call or one prompt call
+    auto run = [&](WhisperPipeline & p, const std::vector<int32_t> & tokens, bool batched, std::vector<float> * logits, int32_t * next) {
+        MetalWhisperDecoder & dec = p.decoder();
+        EXPECT(dec.set_audio(states.data()).is_ok());
+        if (batched) EXPECT(dec.eval_prompt(tokens).is_ok());
+        else for (size_t i = 0; i < tokens.size(); i++) EXPECT(dec.eval_token(tokens[i], i + 1 == tokens.size()).is_ok());
+        *logits = dec.logits().value();
+        *next = dec.pending_token().value();
+        EXPECT(dec.position() == static_cast<int32_t>(tokens.size()));
+    };
+    auto pipe = WhisperPipeline::create({d + "/encoder-fp16.mlpackage", d + "/decoder.gguf"});
+    EXPECT(pipe.is_ok());
+    if (!pipe.is_ok()) return;
+    std::vector<int32_t> prompt = pipe.value().prompt(), longer = prompt;
+    for (size_t i = 0; i < 7 && i < generated.size(); i++) longer.push_back(generated[i]);   // 11 tokens: two passes (8 + 3)
+    EXPECT(longer.size() > 8);
+    for (const auto * toks : {&prompt, &longer}) {
+        std::vector<float> a, b;
+        int32_t na = -1, nb = -2;
+        run(pipe.value(), *toks, false, &a, &na);
+        run(pipe.value(), *toks, true, &b, &nb);
+        std::printf("        %zu prompt tokens: batched vs one by one rel %.1e, next %d / %d\n", toks->size(), rel_l2(b, a), nb, na);
+        EXPECT(rel_l2(b, a) < 1e-4);
+        EXPECT(na == nb);
+    }
+    std::vector<float> want;
+    int32_t want_next = -1;
+    run(pipe.value(), longer, false, &want, &want_next);
+    for (int32_t splits : {1, 7, 64}) {   // 64: chunks of 24 positions, the last split is empty (63 * 24 > 1500)
+        for (int32_t fused : {0, 1}) {
+            WhisperOptions o;
+            o.cross_splits = splits;
+            o.fused_layernorm = fused;
+            auto tuned = WhisperPipeline::create({d + "/encoder-fp16.mlpackage", d + "/decoder.gguf"}, o);
+            EXPECT(tuned.is_ok());
+            if (!tuned.is_ok()) continue;
+            for (bool batched : {false, true}) {
+                std::vector<float> got;
+                int32_t next = -1;
+                run(tuned.value(), longer, batched, &got, &next);
+                if (rel_l2(got, want) >= 1e-4 || next != want_next) std::printf("        splits %d fused %d batched %d: rel %.1e next %d / %d\n", splits, fused, batched, rel_l2(got, want), next, want_next);
+                EXPECT(rel_l2(got, want) < 1e-4);
+                EXPECT(next == want_next);
+            }
+        }
+    }
+    MetalWhisperDecoder & dec = pipe.value().decoder();
+    EXPECT(dec.set_audio(states.data()).is_ok());
+    EXPECT(dec.eval_prompt({}).code() == Code::InvalidArgument);
+    EXPECT(dec.eval_prompt({-1}).code() == Code::InvalidArgument);
+    EXPECT(dec.eval_prompt(std::vector<int32_t>(static_cast<size_t>(dec.config().n_text_ctx) + 1, prompt[0])).code() == Code::ResourceExhausted);
+    WhisperOptions bad;
+    bad.cross_splits = -1;
+    EXPECT(!WhisperPipeline::create({d + "/encoder-fp16.mlpackage", d + "/decoder.gguf"}, bad).is_ok());
 }
 
 int main() { return dooms_test::run_all(); }

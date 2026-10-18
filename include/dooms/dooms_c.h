@@ -275,6 +275,42 @@ DOOMS_API dooms_code dooms_whisper_transcribe_file(dooms_whisper * whisper, cons
 DOOMS_API dooms_code dooms_whisper_last_text(const dooms_whisper * whisper, char * out, size_t capacity, size_t * needed);
 DOOMS_API dooms_code dooms_whisper_last_timings(const dooms_whisper * whisper, dooms_whisper_timings * out);
 
+/* ---------------------------------------------------------------- text to speech (Kokoro-82M: prosody on Core ML, the vocoder on the engine's own Metal kernels)
+ * The input is phonemes (misaki's symbols, UTF-8; the Python binding converts English text with misaki). Output: mono float samples in [-1, 1] at
+ * dooms_tts_sample_rate. Files from tools/convert/convert_kokoro.py (docs/formats/kokoro-gguf.md). */
+typedef struct dooms_tts dooms_tts;
+
+typedef struct dooms_tts_paths {
+    size_t struct_size;
+    const char * prosody;  /* prosody-fp32.mlpackage */
+    const char * f0n;      /* f0n-fp32.mlpackage */
+    const char * model;    /* kokoro.gguf */
+} dooms_tts_paths;
+
+typedef struct dooms_tts_options {
+    size_t struct_size;
+    const char * units;    /* the Core ML packages' units: "cpu" (NULL: the default; fastest for their LSTMs), "cpu_gpu", "all" */
+} dooms_tts_options;
+
+typedef struct dooms_tts_timings {
+    size_t struct_size;
+    double prosody_ms, f0n_ms, source_ms, vocoder_ms, istft_ms, total_ms;   /* wall time of the last synthesis, per stage and in all */
+    double audio_s;
+    int32_t tokens, frames;
+} dooms_tts_timings;
+
+DOOMS_API dooms_code dooms_tts_open(const dooms_tts_paths * paths, const dooms_tts_options * options, dooms_tts ** out);
+DOOMS_API void dooms_tts_close(dooms_tts * tts);
+DOOMS_API int32_t dooms_tts_sample_rate(const dooms_tts * tts);    /* 24000; 0 for NULL */
+DOOMS_API int32_t dooms_tts_max_phonemes(const dooms_tts * tts);   /* per call; 0 for NULL */
+DOOMS_API int32_t dooms_tts_voice_count(const dooms_tts * tts);
+DOOMS_API const char * dooms_tts_voice_name(const dooms_tts * tts, int32_t index);   /* NULL outside [0, count); valid while the handle lives */
+/* phonemes -> samples (capacity in floats; *needed receives the sample count). A result that did not fit stays in the handle: dooms_tts_last_audio fetches
+ * it. speed > 0 (1: the model's pace); seed: the sine source's noise (the same seed gives the same samples). */
+DOOMS_API dooms_code dooms_tts_synthesize(dooms_tts * tts, const char * phonemes, const char * voice, float speed, uint64_t seed, float * out, size_t capacity, size_t * needed);
+DOOMS_API dooms_code dooms_tts_last_audio(const dooms_tts * tts, float * out, size_t capacity, size_t * needed);
+DOOMS_API dooms_code dooms_tts_last_timings(const dooms_tts * tts, dooms_tts_timings * out);
+
 #ifdef __cplusplus
 }
 #endif

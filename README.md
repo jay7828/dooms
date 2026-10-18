@@ -7,6 +7,7 @@ Neural Engine (Core ML).
   any other GGUF through [llama.cpp](https://github.com/ggml-org/llama.cpp) (every architecture and quantization). Chat templates, streaming, stop strings,
   seeded sampling, and an OpenAI-compatible server (`dooms serve`).
 - **Vision-language** (SmolVLM): the vision tower on the Neural Engine, the language model on the engine's own decoder.
+- **Text to speech** (Kokoro-82M): prosody on Core ML, the vocoder on the engine's own Metal kernels; English text through misaki.
 - **Speech to text** (Whisper, tiny to large-v3-turbo): the encoder on Core ML, the decoder on the engine's own Metal kernels; any audio file Core Audio decodes.
 - **Vision-language-action** (SmolVLA): three cameras plus a prompt to a 50-step action chunk in about 270 ms, and an asynchronous runner that computes the next
   chunk while the robot executes the current one.
@@ -48,15 +49,24 @@ In a simulated 30 Hz control loop the asynchronous runner removes every stall (9
 
 | | large-v3-turbo | WER | tiny | WER |
 |---|--:|--:|--:|--:|
-| **dooms.cpp** | 54.8 s | 3.25% | 3.24 s | 12.2% |
-| MLX-Whisper fp16 | **53.9 s** | 3.42% | **3.08 s** | 12.1% |
-| whisper.cpp (Metal) | 64.5 s | 3.25% | 5.44 s | 12.0% |
+| **dooms.cpp** | **53.6 s** | 3.25% | **2.81 s** | 12.2% |
+| MLX-Whisper fp16 | 53.6 s | 3.42% | 3.03 s | 12.1% |
+| whisper.cpp (Metal) | 63.8 s | 3.25% | 5.05 s | 12.0% |
 | PyTorch MPS fp16 | 105.0 s | 3.25% | 15.1 s | 12.1% |
 | Sapient (Metal) | 948 s | 3.34% | 68.6 s | 18.5% |
 
-Level with MLX (on one 8-minute file dooms.cpp is ahead: turbo 16.2 s vs 16.3, tiny 1.66 s vs 1.80), ahead of everything else, with PyTorch's WER.
+Level with MLX on turbo (the encoder, the same time in both, is 90% of it), 7% ahead on tiny (21% on one 8-minute file), with PyTorch's WER.
 
-Tokens match transformers' on the reference prompts, photos and audio clips for every model above.
+**Text to speech** (Kokoro-82M, 73 sentences = 404 s of speech, the same phonemes and voice for every engine)
+
+| | seconds | Whisper WER of the audio |
+|---|--:|--:|
+| **dooms.cpp** | **15.1** | 3.34% |
+| MLX fp32 (mlx-audio) | 23.5 | 3.42% |
+| PyTorch MPS fp32 | 33.3 | 3.34% |
+| ONNX Runtime CPU | 86.0 | 3.42% |
+
+Tokens match transformers' on the reference prompts, photos and audio clips for every model above; Kokoro's audio matches PyTorch's within 1.4e-2 given the same noise.
 
 ## Use it
 

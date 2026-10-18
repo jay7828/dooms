@@ -199,8 +199,15 @@
         { title: "large-v3-turbo, one 8-minute file, seconds, lower is better", rows: D.speech.turboLong.map((t) => ({ sys: t.sys, name: t.name, value: t.s })), unit: "s", better: "lower" },
         { title: "tiny, 73 clips, seconds, lower is better", rows: D.speech.tinyClips.map((t) => ({ sys: t.sys, name: t.name, value: t.s })), unit: "s", better: "lower" },
       ],
-      note: `<p><strong>Level with MLX, ahead of everything else</strong>: 1.2 to 2.3x whisper.cpp, 1.9 to 6.7x PyTorch, 15 to 21x Sapient. Ahead of MLX on long audio, 2 to 5% behind on short clips.</p>
+      note: `<p><strong>Fastest on every set</strong>: level with MLX on large-v3-turbo (the shared Core ML/MLX encoder time dominates), 7 to 21% ahead of it on tiny, 1.2 to 2.6x whisper.cpp, 2 to 8x PyTorch, 15 to 24x Sapient.</p>
              <p>The encoder runs on Core ML (the GPU: on the Neural Engine it was slower and less accurate), the decoder on the engine's own Metal kernels. Word error rate equals PyTorch's: 3.25% for turbo.</p>`,
+    },
+    tts: {
+      title: "Kokoro-82M text to speech",
+      sub: "404 s of speech from the same phonemes and voice",
+      charts: [{ title: "seconds, lower is better", rows: D.tts.map((t) => ({ sys: t.sys, name: t.name, value: t.s })), unit: "s", better: "lower" }],
+      note: `<p><strong>1.55x MLX, 2.2x PyTorch on the GPU, 5.7x ONNX Runtime</strong>: the vocoder runs on the engine's own Metal kernels, prosody on Core ML.</p>
+             <p>Intelligibility equals PyTorch's: 3.34% word error rate when Whisper transcribes the audio of each engine.</p>`,
     },
     vit: {
       title: "A 631M-parameter ViT",

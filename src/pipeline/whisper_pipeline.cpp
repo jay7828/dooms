@@ -93,6 +93,7 @@ bool WhisperPipeline::is_end_of_text(int32_t token) const { return token == impl
 
 Result<WhisperPipeline> WhisperPipeline::create(const WhisperPaths & paths, const WhisperOptions & o) {
     if (o.max_tokens_per_window < 1 || o.queue_depth < 1) return invalid_argument("max_tokens_per_window and queue_depth must be >= 1");
+    if (o.cross_splits < 0) return invalid_argument("cross_splits must be >= 0");
     if (o.task != "transcribe" && o.task != "translate") return invalid_argument("task must be \"transcribe\" or \"translate\", got \"" + o.task + "\"");
     auto file = GgufFile::open(paths.decoder);
     if (!file.is_ok()) return file.status();
@@ -129,6 +130,8 @@ Result<WhisperPipeline> WhisperPipeline::create(const WhisperPaths & paths, cons
     dc.n_audio_ctx = m.n_audio_ctx;
     dc.ln_eps = static_cast<float>(eps.value());
     dc.spin_wait = o.spin_wait;
+    dc.cross_splits = o.cross_splits;
+    dc.fused_layernorm = o.fused_layernorm;
     if (o.max_tokens_per_window > m.n_text_ctx / 2) return invalid_argument("max_tokens_per_window must be at most n_text_ctx / 2 = " + std::to_string(m.n_text_ctx / 2));
 
     // Language token.
@@ -280,9 +283,7 @@ Result<WhisperResult> WhisperPipeline::transcribe(const std::vector<float> & sam
         tm.encoder_ms += ms_since(t);
         t = Clock::now();
         if (Status st = m.decoder->set_audio(m.states.data()); !st.is_ok()) return st;
-        for (size_t i = 0; i < pr.size(); i++) {
-            if (Status st = m.decoder->eval_token(pr[i], i + 1 == pr.size()); !st.is_ok()) return st;
-        }
+        if (Status st = m.decoder->eval_prompt(pr); !st.is_ok()) return st;
         std::vector<int32_t> window;
         Status st = m.decoder->generate(m.options.max_tokens_per_window, m.options.queue_depth, [&](int32_t tok) {
             if (tok == m.eot) return false;

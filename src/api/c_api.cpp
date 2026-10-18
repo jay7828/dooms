@@ -15,6 +15,7 @@
 
 #include "pipeline/rgb_image.h"
 #include "pipeline/vla_chunk_runner.h"
+#include "pipeline/kokoro_pipeline.h"
 #include "pipeline/whisper_pipeline.h"
 #ifdef DOOMS_WITH_LLAMA
 #include "models/vlm/tokenizer.h"
@@ -853,6 +854,105 @@ DOOMS_API dooms_code dooms_whisper_last_timings(const dooms_whisper * whisper, d
         t.audio_s = s.audio_s;
         t.windows = static_cast<int32_t>(s.windows);
         t.tokens = static_cast<int32_t>(s.tokens);
+        const size_t n = std::min(out->struct_size, sizeof(t));
+        t.struct_size = out->struct_size;
+        std::memcpy(out, &t, n);
+        return DOOMS_OK;
+    });
+}
+
+}  // extern "C"
+
+// ------------------------------------------------------------------------------------------------ text to speech (Kokoro)
+struct dooms_tts {
+    std::unique_ptr<dooms::KokoroPipeline> pipeline;
+    std::vector<std::string> voices;
+    std::vector<float> audio;    // last successful synthesis
+    bool has_audio = false;
+    dooms::KokoroTimings timings;
+};
+
+namespace {
+
+dooms_code write_samples(const std::vector<float> & a, float * out, size_t capacity, size_t * needed) {
+    if (needed) *needed = a.size();
+    if (!out && capacity > 0) return fail(DOOMS_INVALID_ARGUMENT, "out is NULL");
+    if (capacity < a.size()) return fail(DOOMS_RESOURCE_EXHAUSTED, "the output buffer holds " + std::to_string(capacity) + " samples, " + std::to_string(a.size()) + " are needed");
+    if (!a.empty()) std::memcpy(out, a.data(), a.size() * sizeof(float));
+    return DOOMS_OK;
+}
+
+}  // namespace
+
+extern "C" {
+
+DOOMS_API dooms_code dooms_tts_open(const dooms_tts_paths * paths, const dooms_tts_options * options, dooms_tts ** out) {
+    return guarded([&]() -> dooms_code {
+        dooms_code c;
+        if (!out) return fail(DOOMS_INVALID_ARGUMENT, "out is NULL");
+        *out = nullptr;
+        if (!struct_ok(paths, "paths", &c)) return c;
+        if (!paths->prosody || !*paths->prosody || !paths->f0n || !*paths->f0n || !paths->model || !*paths->model) {
+            return fail(DOOMS_INVALID_ARGUMENT, "paths.prosody, paths.f0n and paths.model are required");
+        }
+        dooms::KokoroOptions o;
+        if (options) {
+            if (!struct_ok(options, "options", &c)) return c;
+            o.units = or_default(options->units, o.units.c_str());
+        }
+        auto p = dooms::KokoroPipeline::create({paths->prosody, paths->f0n, paths->model}, o);
+        if (!p.is_ok()) return from_status(p.status());
+        auto h = std::make_unique<dooms_tts>();
+        h->pipeline = std::make_unique<dooms::KokoroPipeline>(std::move(p).value());
+        h->voices = h->pipeline->voices();
+        *out = h.release();
+        return DOOMS_OK;
+    });
+}
+
+DOOMS_API void dooms_tts_close(dooms_tts * tts) { delete tts; }
+DOOMS_API int32_t dooms_tts_sample_rate(const dooms_tts * tts) { return tts && tts->pipeline ? tts->pipeline->sample_rate() : 0; }
+DOOMS_API int32_t dooms_tts_max_phonemes(const dooms_tts * tts) { return tts && tts->pipeline ? tts->pipeline->max_phonemes() : 0; }
+DOOMS_API int32_t dooms_tts_voice_count(const dooms_tts * tts) { return tts ? static_cast<int32_t>(tts->voices.size()) : 0; }
+DOOMS_API const char * dooms_tts_voice_name(const dooms_tts * tts, int32_t index) {
+    if (!tts || index < 0 || index >= static_cast<int32_t>(tts->voices.size())) return nullptr;
+    return tts->voices[static_cast<size_t>(index)].c_str();
+}
+
+DOOMS_API dooms_code dooms_tts_synthesize(dooms_tts * tts, const char * phonemes, const char * voice, float speed, uint64_t seed, float * out, size_t capacity, size_t * needed) {
+    return guarded([&]() -> dooms_code {
+        if (!tts) return fail(DOOMS_INVALID_ARGUMENT, "tts is NULL");
+        if (!phonemes || !*phonemes) return fail(DOOMS_INVALID_ARGUMENT, "phonemes is NULL or empty");
+        if (!voice || !*voice) return fail(DOOMS_INVALID_ARGUMENT, "voice is NULL or empty");
+        dooms::KokoroTimings tm;
+        auto a = tts->pipeline->synthesize(phonemes, voice, speed, seed, &tm);
+        if (!a.is_ok()) return from_status(a.status());
+        tts->audio = std::move(a).value();
+        tts->has_audio = true;
+        tts->timings = tm;
+        return write_samples(tts->audio, out, capacity, needed);
+    });
+}
+
+DOOMS_API dooms_code dooms_tts_last_audio(const dooms_tts * tts, float * out, size_t capacity, size_t * needed) {
+    return guarded([&]() -> dooms_code {
+        if (!tts) return fail(DOOMS_INVALID_ARGUMENT, "tts is NULL");
+        if (!tts->has_audio) return fail(DOOMS_NOT_FOUND, "no synthesis has finished on this handle");
+        return write_samples(tts->audio, out, capacity, needed);
+    });
+}
+
+DOOMS_API dooms_code dooms_tts_last_timings(const dooms_tts * tts, dooms_tts_timings * out) {
+    return guarded([&]() -> dooms_code {
+        dooms_code c;
+        if (!tts) return fail(DOOMS_INVALID_ARGUMENT, "tts is NULL");
+        if (!struct_ok(out, "out", &c)) return c;
+        dooms_tts_timings t{};
+        const dooms::KokoroTimings & s = tts->timings;
+        t.prosody_ms = s.prosody_ms; t.f0n_ms = s.f0n_ms; t.source_ms = s.source_ms; t.vocoder_ms = s.vocoder_ms; t.istft_ms = s.istft_ms; t.total_ms = s.total_ms;
+        t.audio_s = s.audio_s;
+        t.tokens = static_cast<int32_t>(s.tokens);
+        t.frames = static_cast<int32_t>(s.frames);
         const size_t n = std::min(out->struct_size, sizeof(t));
         t.struct_size = out->struct_size;
         std::memcpy(out, &t, n);
