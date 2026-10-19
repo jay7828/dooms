@@ -8,7 +8,7 @@
 #include <utility>
 
 #include "backend/coreml/coreml_model.h"
-#include "backend/metal/metal_kokoro_vocoder.h"
+#include "backend/kokoro_vocoder.h"
 #include "core/tensor.h"
 #include "format/gguf.h"
 #include "pipeline/kokoro_vocoder_loader.h"
@@ -207,7 +207,7 @@ KokoroNoise kokoro_draw_noise(int64_t samples, int32_t harmonics, uint64_t seed)
 
 struct KokoroPipeline::Impl {
     std::unique_ptr<CoreMlModel> prosody, f0n;
-    std::unique_ptr<MetalKokoroVocoder> vocoder;
+    std::unique_ptr<KokoroVocoder> vocoder;
     std::map<std::string, int32_t> vocab;
     std::map<std::string, std::vector<float>> voices;   // [rows][2 * style_dim]
     KokoroSourceConfig src;
@@ -222,6 +222,7 @@ KokoroPipeline & KokoroPipeline::operator=(KokoroPipeline &&) noexcept = default
 KokoroPipeline::~KokoroPipeline() = default;
 
 int32_t KokoroPipeline::sample_rate() const { return impl_->src.sample_rate; }
+const char * KokoroPipeline::device() const { return impl_->vocoder->device(); }
 int32_t KokoroPipeline::max_phonemes() const { return std::min(impl_->voice_rows, impl_->max_tokens - 2); }
 std::vector<std::string> KokoroPipeline::voices() const {
     std::vector<std::string> out;
@@ -280,7 +281,7 @@ Result<KokoroPipeline> KokoroPipeline::create(const KokoroPaths & paths, const K
     const float * w = reinterpret_cast<const float *>(f.tensor_data(*lw.value()));
     m.lin_w.assign(w, w + m.src.harmonics);
     m.lin_b = reinterpret_cast<const float *>(f.tensor_data(*lb.value()))[0];
-    auto voc = load_kokoro_vocoder(f, o.spin_wait);
+    auto voc = load_kokoro_vocoder(f, o.spin_wait, o.device);
     if (!voc.is_ok()) return voc.status();
     m.vocoder = std::move(voc).value();
     auto p = CoreMlModel::load(paths.prosody, units.value());

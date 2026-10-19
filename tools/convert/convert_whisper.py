@@ -24,6 +24,8 @@ def main(argv=None) -> int:
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--no-encoder", action="store_true", help="only the decoder GGUF")
     ap.add_argument("--encoder-check-units", default="gpu", choices=["cpu", "gpu", "ne"], help="compute units the encoder's accuracy check runs on")
+    ap.add_argument("--cpu-encoder", action="store_true", help="also write encoder-fp32.mlpackage, which the pipeline uses when the encoder runs on the CPU")
+    ap.add_argument("--only-cpu-encoder", action="store_true", help="write only encoder-fp32.mlpackage (next to existing files)")
     ap.add_argument("--encoder-max-rel-l2", type=float, default=2e-2,
                     help="largest relative L2 error of the fp16 encoder vs PyTorch fp32 on random features (whisper-large-v3-turbo's 32 layers: 2.3e-2 on gpu; "
                          "the real-speech criterion is tests/unit/test_whisper.cpp)")
@@ -37,9 +39,14 @@ def main(argv=None) -> int:
         t0 = time.time()
         model, processor, gen = wm.load(a.model)
         wm.check_supported(model, processor)
-        wm.write_decoder(model, processor, gen, os.path.join(out, "decoder.gguf"))
-        print(f"decoder.gguf written ({time.time() - t0:.0f} s)")
-        if not a.no_encoder:
+        if not a.only_cpu_encoder:
+            wm.write_decoder(model, processor, gen, os.path.join(out, "decoder.gguf"))
+            print(f"decoder.gguf written ({time.time() - t0:.0f} s)")
+        if a.cpu_encoder or a.only_cpu_encoder:
+            t0 = time.time()
+            err = wm.convert_encoder(model, os.path.join(out, "encoder-fp32.mlpackage"), compute_units="cpu", max_rel_l2=1e-3, precision="fp32")
+            print(f"encoder-fp32.mlpackage written ({time.time() - t0:.0f} s), relative L2 vs PyTorch fp32 on cpu: {err:.2e}")
+        if not a.no_encoder and not a.only_cpu_encoder:
             t0 = time.time()
             err = wm.convert_encoder(model, os.path.join(out, "encoder-fp16.mlpackage"), compute_units=a.encoder_check_units, max_rel_l2=a.encoder_max_rel_l2)
             print(f"encoder-fp16.mlpackage written ({time.time() - t0:.0f} s), relative L2 vs PyTorch fp32 on {a.encoder_check_units}: {err:.2e}")

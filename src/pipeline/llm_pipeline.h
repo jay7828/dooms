@@ -18,6 +18,9 @@ struct LlmOptions {
     TextDecoderOptions text;  // n_ctx (prompt + answer), n_batch, n_gpu_layers, n_threads
     // "auto": the own Metal decoder when it can run the file, otherwise llama.cpp; "metal": the own decoder or an error; "llama.cpp".
     std::string text_engine = "auto";
+    // "auto": the GPU (the own decoder or llama.cpp's Metal), the CPU without one; "gpu"; "cpu" (llama.cpp on the CPU, no GPU layers). DOOMS_DEVICE overrides
+    // "auto" (pipeline/device.h). With "auto", text.n_gpu_layers == 0 also means the CPU (the own decoder is GPU-only).
+    std::string device = "auto";
     int32_t metal_queue_depth = 1;   // decode steps the Metal decoder keeps queued (greedy generation)
     LlmOptions() { text.n_ctx = 4096; }
 };

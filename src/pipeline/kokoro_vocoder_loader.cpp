@@ -1,5 +1,9 @@
 #include "pipeline/kokoro_vocoder_loader.h"
 
+#include "backend/cpu/cpu_kokoro_vocoder.h"
+#include "backend/metal/metal_kokoro_vocoder.h"
+#include "pipeline/device.h"
+
 #include <string>
 #include <vector>
 
@@ -20,7 +24,7 @@ Result<std::vector<int32_t>> ints(const GgufFile & f, const std::string & key) {
 
 }  // namespace
 
-Result<std::unique_ptr<MetalKokoroVocoder>> load_kokoro_vocoder(const GgufFile & f, bool spin_wait) {
+Result<std::unique_ptr<KokoroVocoder>> load_kokoro_vocoder(const GgufFile & f, bool spin_wait, const std::string & device) {
     KokoroVocoderConfig c;
     for (auto [key, dst] : std::initializer_list<std::pair<const char *, int32_t *>>{
              {"kokoro.hidden_dim", &c.hidden}, {"kokoro.style_dim", &c.style_dim}, {"kokoro.n_fft", &c.n_fft}, {"kokoro.upsample_initial_channel", &c.initial_channel}}) {
@@ -45,7 +49,16 @@ Result<std::unique_ptr<MetalKokoroVocoder>> load_kokoro_vocoder(const GgufFile &
         for (int i = 0; i < info.shape.rank(); i++) k.shape.push_back(info.shape.dim(i));
         t.emplace(info.name, std::move(k));
     }
-    return MetalKokoroVocoder::create(c, t);
+    auto choice = resolve_device(device);
+    if (!choice.is_ok()) return choice.status();
+    if (choice.value().try_gpu) {
+        auto v = MetalKokoroVocoder::create(c, t);
+        if (v.is_ok()) return std::unique_ptr<KokoroVocoder>(std::move(v).value());
+        if (!choice.value().allow_fallback) return v.status();
+    }
+    auto v = CpuKokoroVocoder::create(c, t);
+    if (!v.is_ok()) return v.status();
+    return std::unique_ptr<KokoroVocoder>(std::move(v).value());
 }
 
 }  // namespace dooms

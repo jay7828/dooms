@@ -34,6 +34,14 @@ class Llm(unittest.TestCase):
         self.assertIn(cm.exception.code, ("NotFound", "Unsupported"))
 
     @unittest.skipUnless(LLM_FILE and os.path.exists(LLM_FILE), "set DOOMS_LLM_FILE to a chat-tuned GGUF")
+    def test_device(self):
+        with dooms.LLM(LLM_FILE, n_ctx=256, device="cpu") as llm:
+            self.assertGreater(len(llm.generate("The capital of France is", 4)), 0)
+        with self.assertRaises(dooms.DoomsError) as cm:
+            dooms.LLM(LLM_FILE, device="tpu")
+        self.assertEqual(cm.exception.code, "InvalidArgument")
+
+    @unittest.skipUnless(LLM_FILE and os.path.exists(LLM_FILE), "set DOOMS_LLM_FILE to a chat-tuned GGUF")
     def test_generate_chat_stream_and_errors(self):
         with dooms.LLM(LLM_FILE, n_ctx=1024) as llm:
             self.assertEqual(llm.context_size, 1024)
@@ -103,6 +111,20 @@ class Whisper(unittest.TestCase):
             dooms.Whisper(WHISPER_DIR, language="xx")
         self.assertEqual(cm.exception.code, "InvalidArgument")
 
+    @unittest.skipUnless(os.path.exists(os.path.join(WHISPER_DIR, "decoder.gguf")) and os.path.exists(os.path.join(SPEECH, "1272-128104-0000.wav")),
+                         "whisper-tiny and the speech clips not available")
+    def test_device(self):
+        clip = os.path.join(SPEECH, "1272-128104-0000.wav")
+        with dooms.Whisper(WHISPER_DIR) as stt:
+            self.assertIn(stt.device, ("gpu", "cpu"))
+            text = stt.transcribe(clip)
+        with dooms.Whisper(WHISPER_DIR, device="cpu") as stt:
+            self.assertEqual(stt.device, "cpu")
+            self.assertEqual(stt.transcribe(clip), text)
+        with self.assertRaises(dooms.DoomsError) as cm:
+            dooms.Whisper(WHISPER_DIR, device="tpu")
+        self.assertEqual(cm.exception.code, "InvalidArgument")
+
 
 TTS_DIR = os.path.join(MODELS, "kokoro", "Kokoro-82M", "dooms")
 
@@ -141,6 +163,21 @@ class Tts(unittest.TestCase):
             with self.assertRaises(dooms.DoomsError) as cm:
                 tts.synthesize(ph, "nobody")
             self.assertEqual(cm.exception.code, "InvalidArgument")
+
+    @unittest.skipUnless(os.path.exists(os.path.join(TTS_DIR, "kokoro.gguf")), "Kokoro (tools/convert/convert_kokoro.py) not available")
+    def test_device(self):
+        ph = "h\u0259l\u02c8O w\u02c8\u025c\u0279ld."
+        with dooms.TTS(TTS_DIR) as tts:
+            self.assertIn(tts.device, ("gpu", "cpu"))
+            a = tts.synthesize(ph, "af_heart", seed=3)
+        with dooms.TTS(TTS_DIR, device="cpu") as tts:
+            self.assertEqual(tts.device, "cpu")
+            b = tts.synthesize(ph, "af_heart", seed=3)
+        self.assertEqual(len(a), len(b))
+        self.assertLess(float(np.linalg.norm(a - b) / np.linalg.norm(a)), 0.05)
+        with self.assertRaises(dooms.DoomsError) as cm:
+            dooms.TTS(TTS_DIR, device="tpu")
+        self.assertEqual(cm.exception.code, "InvalidArgument")
 
 
 class ErrorPaths(unittest.TestCase):

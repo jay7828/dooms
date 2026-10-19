@@ -3,12 +3,16 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <map>
 
 #include "backend/coreml/coreml_model.h"
+#include "backend/cpu/cpu_whisper_decoder.h"
 #include "backend/metal/metal_whisper_decoder.h"
+#include "core/log.h"
 #include "format/gguf.h"
 #include "pipeline/audio_io.h"
+#include "pipeline/device.h"
 #include "pipeline/whisper_features.h"
 
 namespace dooms {
@@ -70,7 +74,7 @@ int64_t as_int(const GgufValue & v) {
 struct WhisperPipeline::Impl {
     WhisperOptions options;
     std::unique_ptr<CoreMlModel> encoder;
-    std::unique_ptr<MetalWhisperDecoder> decoder;
+    std::unique_ptr<WhisperTextDecoder> decoder;
     std::unique_ptr<WhisperFeatures> features;
     int32_t sample_rate = 0, chunk = 0, n_mels = 0, n_audio_ctx = 0, n_state = 0, n_text_ctx = 0, n_text_tokens = 0;
     int32_t sot = 0, eot = 0, notimestamps = 0, lang = 0, task = 0;
@@ -88,7 +92,8 @@ int32_t WhisperPipeline::sample_rate() const { return impl_->sample_rate; }
 int32_t WhisperPipeline::window_samples() const { return impl_->chunk; }
 int32_t WhisperPipeline::n_mels() const { return impl_->n_mels; }
 int32_t WhisperPipeline::n_frames() const { return impl_->features->n_frames(); }
-MetalWhisperDecoder & WhisperPipeline::decoder() { return *impl_->decoder; }
+WhisperTextDecoder & WhisperPipeline::decoder() { return *impl_->decoder; }
+const char * WhisperPipeline::device() const { return impl_->decoder->device(); }
 bool WhisperPipeline::is_end_of_text(int32_t token) const { return token == impl_->eot; }
 
 Result<WhisperPipeline> WhisperPipeline::create(const WhisperPaths & paths, const WhisperOptions & o) {
@@ -193,9 +198,18 @@ Result<WhisperPipeline> WhisperPipeline::create(const WhisperPaths & paths, cons
             if (Status st = ref(b + name, dst); !st.is_ok()) return st;
         }
     }
-    auto dec = MetalWhisperDecoder::create(dc, w);
-    if (!dec.is_ok()) return dec.status();
-    m.decoder = std::move(dec).value();
+    auto choice = resolve_device(o.device);
+    if (!choice.is_ok()) return choice.status();
+    if (choice.value().try_gpu) {
+        auto dec = MetalWhisperDecoder::create(dc, w);
+        if (dec.is_ok()) m.decoder = std::move(dec).value();
+        else if (!choice.value().allow_fallback) return dec.status();
+    }
+    if (!m.decoder) {   // "cpu", or "auto" without a usable GPU
+        auto dec = CpuWhisperDecoder::create(dc, w);
+        if (!dec.is_ok()) return dec.status();
+        m.decoder = std::move(dec).value();
+    }
     if (Status st = m.decoder->set_suppression(suppress, begin); !st.is_ok()) return st;
 
     // Features.
@@ -214,9 +228,23 @@ Result<WhisperPipeline> WhisperPipeline::create(const WhisperPaths & paths, cons
     if (m.features->n_frames() != 2 * m.n_audio_ctx) return invalid_argument("the encoder takes " + std::to_string(2 * m.n_audio_ctx) + " frames, the features give " + std::to_string(m.features->n_frames()));
 
     // Encoder.
-    auto units = parse_coreml_units(o.encoder_units);
+    // the encoder's Core ML units: the given ones, or the GPU with a GPU decoder and the CPU with the CPU decoder
+    const std::string enc_units = !o.encoder_units.empty() ? o.encoder_units : (std::string(m.decoder->device()) == "gpu" ? "cpu_gpu" : "cpu");
+    auto units = parse_coreml_units(enc_units);
+    // On the CPU an fp16 package is computed in half precision (large-v3-turbo: 0.18 relative L2, punctuation lost; whisper-tiny: the same text on the 9
+    // LibriSpeech clips); the converter's fp32 package next to it (convert_whisper.py --cpu-encoder) is used instead when present, otherwise a warning.
+    std::string enc_path = paths.encoder;
+    if (enc_units == "cpu") {
+        const std::string suffix = "encoder-fp16.mlpackage";
+        const bool fp16 = enc_path.size() >= suffix.size() && enc_path.compare(enc_path.size() - suffix.size(), suffix.size(), suffix) == 0;
+        const std::string fp32 = fp16 ? enc_path.substr(0, enc_path.size() - suffix.size()) + "encoder-fp32.mlpackage" : "";
+        if (fp16 && std::ifstream(fp32 + "/Manifest.json").good()) enc_path = fp32;
+        else if (fp16)
+            DOOMS_LOG_WARN("whisper: the encoder runs on the CPU from its fp16 package, which can be less accurate there (large models: punctuation); "
+                           "tools/convert/convert_whisper.py --only-cpu-encoder writes %s", fp32.c_str());
+    }
     if (!units.is_ok()) return units.status();
-    auto enc = CoreMlModel::load(paths.encoder, units.value());
+    auto enc = CoreMlModel::load(enc_path, units.value());
     if (!enc.is_ok()) return enc.status();
     m.encoder = std::make_unique<CoreMlModel>(std::move(enc).value());
     auto in_shape = Shape::create({1, m.n_mels, m.features->n_frames()});

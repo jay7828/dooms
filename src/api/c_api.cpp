@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <cstddef>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -334,6 +335,7 @@ DOOMS_API dooms_code dooms_llm_open(const char * gguf_path, const dooms_llm_opti
             if (lo.text.n_batch > lo.text.n_ctx) lo.text.n_batch = lo.text.n_ctx;
             lo.text.n_threads = options->n_threads;
             lo.text.n_gpu_layers = options->n_gpu_layers;
+            if (options->struct_size >= offsetof(dooms_llm_options, device) + sizeof(options->device)) lo.device = or_default(options->device, "auto");
         }
         auto m = dooms::Llm::load(gguf_path, lo);
         if (!m.is_ok()) return from_status(m.status());
@@ -801,6 +803,7 @@ DOOMS_API dooms_code dooms_whisper_open(const dooms_whisper_paths * paths, const
             o.task = or_default(options->task, o.task.c_str());
             if (options->max_tokens < 0) return fail(DOOMS_INVALID_ARGUMENT, "options.max_tokens is negative");
             if (options->max_tokens > 0) o.max_tokens_per_window = options->max_tokens;
+            if (options->struct_size >= offsetof(dooms_whisper_options, device) + sizeof(options->device)) o.device = or_default(options->device, "auto");
         }
         auto p = dooms::WhisperPipeline::create({paths->encoder, paths->decoder}, o);
         if (!p.is_ok()) return from_status(p.status());
@@ -814,6 +817,7 @@ DOOMS_API dooms_code dooms_whisper_open(const dooms_whisper_paths * paths, const
 DOOMS_API void dooms_whisper_close(dooms_whisper * whisper) { delete whisper; }
 
 DOOMS_API int32_t dooms_whisper_sample_rate(const dooms_whisper * whisper) { return whisper && whisper->pipeline ? whisper->pipeline->sample_rate() : 0; }
+DOOMS_API const char * dooms_whisper_device(const dooms_whisper * whisper) { return whisper && whisper->pipeline ? whisper->pipeline->device() : nullptr; }
 
 DOOMS_API dooms_code dooms_whisper_transcribe(dooms_whisper * whisper, const float * samples, size_t n, char * out, size_t capacity, size_t * needed) {
     return guarded([&]() -> dooms_code {
@@ -899,6 +903,7 @@ DOOMS_API dooms_code dooms_tts_open(const dooms_tts_paths * paths, const dooms_t
         if (options) {
             if (!struct_ok(options, "options", &c)) return c;
             o.units = or_default(options->units, o.units.c_str());
+            if (options->struct_size >= offsetof(dooms_tts_options, device) + sizeof(options->device)) o.device = or_default(options->device, "auto");
         }
         auto p = dooms::KokoroPipeline::create({paths->prosody, paths->f0n, paths->model}, o);
         if (!p.is_ok()) return from_status(p.status());
@@ -912,6 +917,7 @@ DOOMS_API dooms_code dooms_tts_open(const dooms_tts_paths * paths, const dooms_t
 
 DOOMS_API void dooms_tts_close(dooms_tts * tts) { delete tts; }
 DOOMS_API int32_t dooms_tts_sample_rate(const dooms_tts * tts) { return tts && tts->pipeline ? tts->pipeline->sample_rate() : 0; }
+DOOMS_API const char * dooms_tts_device(const dooms_tts * tts) { return tts && tts->pipeline ? tts->pipeline->device() : nullptr; }
 DOOMS_API int32_t dooms_tts_max_phonemes(const dooms_tts * tts) { return tts && tts->pipeline ? tts->pipeline->max_phonemes() : 0; }
 DOOMS_API int32_t dooms_tts_voice_count(const dooms_tts * tts) { return tts ? static_cast<int32_t>(tts->voices.size()) : 0; }
 DOOMS_API const char * dooms_tts_voice_name(const dooms_tts * tts, int32_t index) {

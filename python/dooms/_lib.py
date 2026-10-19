@@ -27,7 +27,7 @@ class VlmOptions(ctypes.Structure):
 
 
 class LlmOptions(ctypes.Structure):
-    _fields_ = [("struct_size", c_size_t), ("n_ctx", c_int32), ("n_threads", c_int32), ("n_gpu_layers", c_int32)]
+    _fields_ = [("struct_size", c_size_t), ("n_ctx", c_int32), ("n_threads", c_int32), ("n_gpu_layers", c_int32), ("device", c_char_p)]
 
 
 class LlmSampling(ctypes.Structure):
@@ -78,7 +78,7 @@ class WhisperPaths(ctypes.Structure):
 
 
 class WhisperOptions(ctypes.Structure):
-    _fields_ = [("struct_size", c_size_t), ("units", c_char_p), ("language", c_char_p), ("task", c_char_p), ("max_tokens", c_int32)]
+    _fields_ = [("struct_size", c_size_t), ("units", c_char_p), ("language", c_char_p), ("task", c_char_p), ("max_tokens", c_int32), ("device", c_char_p)]
 
 
 class WhisperTimings(ctypes.Structure):
@@ -91,7 +91,7 @@ class TtsPaths(ctypes.Structure):
 
 
 class TtsOptions(ctypes.Structure):
-    _fields_ = [("struct_size", c_size_t), ("units", c_char_p)]
+    _fields_ = [("struct_size", c_size_t), ("units", c_char_p), ("device", c_char_p)]
 
 
 class TtsTimings(ctypes.Structure):
@@ -197,6 +197,9 @@ def _declare(lib):
         lib.dooms_whisper_close.argtypes = [c_void_p]
         lib.dooms_whisper_sample_rate.restype = c_int32
         lib.dooms_whisper_sample_rate.argtypes = [c_void_p]
+        if hasattr(lib, "dooms_whisper_device"):
+            lib.dooms_whisper_device.restype = c_char_p
+            lib.dooms_whisper_device.argtypes = [c_void_p]
         lib.dooms_whisper_transcribe.restype = code
         lib.dooms_whisper_transcribe.argtypes = [c_void_p, POINTER(c_float), c_size_t, ctypes.c_char_p, c_size_t, POINTER(c_size_t)]
         lib.dooms_whisper_transcribe_file.restype = code
@@ -213,6 +216,9 @@ def _declare(lib):
         for name in ("dooms_tts_sample_rate", "dooms_tts_max_phonemes", "dooms_tts_voice_count"):
             getattr(lib, name).restype = c_int32
             getattr(lib, name).argtypes = [c_void_p]
+        if hasattr(lib, "dooms_tts_device"):
+            lib.dooms_tts_device.restype = c_char_p
+            lib.dooms_tts_device.argtypes = [c_void_p]
         lib.dooms_tts_voice_name.restype = c_char_p
         lib.dooms_tts_voice_name.argtypes = [c_void_p, c_int32]
         lib.dooms_tts_synthesize.restype = code

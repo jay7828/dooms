@@ -23,6 +23,7 @@ struct KokoroPaths {
 
 struct KokoroOptions {
     std::string units = "cpu";   // the two Core ML packages: "cpu" (default: their LSTMs are fastest there, bench/BASELINES.md), "cpu_gpu", "all"
+    std::string device = "auto"; // the vocoder: "auto" (the GPU, the CPU when no Metal device can run it; DOOMS_DEVICE overrides), "gpu", "cpu"
     bool spin_wait = true;
 };
 
@@ -69,6 +70,7 @@ public:
     ~KokoroPipeline();
 
     int32_t sample_rate() const;
+    const char * device() const;     // where the vocoder runs: "gpu" or "cpu"
     std::vector<std::string> voices() const;
     int32_t max_phonemes() const;   // phonemes per call (the voices' style table and ALBERT's positions)
 

@@ -14,7 +14,7 @@
 
 namespace dooms {
 
-class MetalWhisperDecoder;
+class WhisperTextDecoder;
 
 struct WhisperPaths {
     std::string encoder;   // Core ML package
@@ -22,9 +22,12 @@ struct WhisperPaths {
 };
 
 struct WhisperOptions {
-    // "all" | "cpu_gpu" | "cpu_ne" | "cpu". The GPU is the default: more accurate AND faster than the Neural Engine on both models measured (bench/BASELINES.md;
-    // large-v3-turbo's 32 fp16 layers on the Neural Engine are 0.26 relative L2 from PyTorch and change the text).
-    std::string encoder_units = "cpu_gpu";
+    // The decoder's device: "auto" (the GPU, the CPU when no Metal device can run it; DOOMS_DEVICE overrides), "gpu", "cpu" (pipeline/device.h).
+    std::string device = "auto";
+    // The encoder's Core ML units: "all" | "cpu_gpu" | "cpu_ne" | "cpu"; empty: "cpu_gpu" with the GPU decoder, "cpu" with the CPU one. The GPU is the default:
+    // more accurate AND faster than the Neural Engine on both models measured (bench/BASELINES.md; large-v3-turbo's 32 fp16 layers on the Neural Engine are 0.26
+    // relative L2 from PyTorch and change the text).
+    std::string encoder_units;
     std::string language = "en";            // a code the model knows ("en", "de", ...)
     std::string task = "transcribe";         // "transcribe" | "translate" (into English)
     int32_t max_tokens_per_window = 224;     // in [1, n_text_ctx / 2] (Whisper's own limit per 30-s window)
@@ -71,7 +74,8 @@ public:
     Status encode(const std::vector<float> & mel, std::vector<float> * states);
     std::vector<int32_t> prompt() const;                       // <|startoftranscript|> <|lang|> <|task|> <|notimestamps|>
     std::string decode_text(const std::vector<int32_t> & tokens) const;
-    MetalWhisperDecoder & decoder();
+    WhisperTextDecoder & decoder();
+    const char * device() const;   // where the decoder runs: "gpu" or "cpu"
     bool is_end_of_text(int32_t token) const;
 
 private:

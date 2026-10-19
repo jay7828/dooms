@@ -1,5 +1,7 @@
 #include "pipeline/llm_pipeline.h"
 
+#include "pipeline/device.h"
+
 #include <algorithm>
 #include <chrono>
 
@@ -44,9 +46,14 @@ Result<Llm> Llm::load(const std::string & path, const LlmOptions & options) {
         return invalid_argument("text_engine must be \"auto\", \"metal\" or \"llama.cpp\", got \"" + options.text_engine + "\"");
     }
     if (options.metal_queue_depth < 1) return invalid_argument("metal_queue_depth must be >= 1");
+    auto choice = resolve_device(options.device);
+    if (!choice.is_ok()) return choice.status();
+    const bool cpu = !choice.value().try_gpu || (choice.value().allow_fallback && options.text.n_gpu_layers == 0);
+    if (cpu && options.text_engine == "metal") return invalid_argument("text_engine \"metal\" runs on the GPU only; device \"cpu\" needs \"auto\" or \"llama.cpp\"");
     std::unique_ptr<MetalLlamaDecoder> native;
     TextDecoderOptions to = options.text;
-    if (options.text_engine != "llama.cpp") {
+    if (cpu) to.n_gpu_layers = 0;
+    if (options.text_engine != "llama.cpp" && !cpu) {
         NativeLlamaOptions no;
         no.n_ctx = options.text.n_ctx;
         no.n_batch = options.text.n_batch;

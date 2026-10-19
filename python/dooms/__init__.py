@@ -226,9 +226,9 @@ class LLM(_Handle):
     strings that end the text before their first occurrence. `on_text(piece)` is called with each new piece (never half a character); returning False stops."""
     _close = "dooms_llm_close"
 
-    def __init__(self, path, *, n_ctx: int = 0, n_threads: int = 0, n_gpu_layers: int = -1):
+    def __init__(self, path, *, n_ctx: int = 0, n_threads: int = 0, n_gpu_layers: int = -1, device: Optional[str] = None):
         super().__init__()
-        opts = _lib.LlmOptions(ctypes.sizeof(_lib.LlmOptions), n_ctx, n_threads, n_gpu_layers)
+        opts = _lib.LlmOptions(ctypes.sizeof(_lib.LlmOptions), n_ctx, n_threads, n_gpu_layers, _b(device))
         _check(_library().dooms_llm_open(_b(path), ctypes.byref(opts), ctypes.byref(self._h)))
 
     @property
@@ -404,11 +404,12 @@ class Whisper(_Handle):
         stt.last_timings.rtf
 
     units: the encoder's Core ML units ("cpu_gpu" by default, "cpu_ne", "all", "cpu"); language: a code the model knows ("en" default); task: "transcribe" or
-    "translate" (into English); max_tokens: text tokens per 30-s window (0: 224)."""
+    "translate" (into English); max_tokens: text tokens per 30-s window (0: 224); device: "auto" (default: the GPU, the CPU when there is none), "gpu", "cpu"
+    (also the environment variable DOOMS_DEVICE)."""
     _close = "dooms_whisper_close"
 
     def __init__(self, model_dir=None, *, encoder=None, decoder=None, units: Optional[str] = None, language: Optional[str] = None, task: Optional[str] = None,
-                 max_tokens: int = 0):
+                 max_tokens: int = 0, device: Optional[str] = None):
         super().__init__()
         self._require("dooms_whisper_open")
         if model_dir is not None:
@@ -418,7 +419,7 @@ class Whisper(_Handle):
         if not encoder or not decoder:
             raise ValueError("pass the model directory, or both encoder= and decoder=")
         paths = _lib.WhisperPaths(ctypes.sizeof(_lib.WhisperPaths), _b(encoder), _b(decoder))
-        opts = _lib.WhisperOptions(ctypes.sizeof(_lib.WhisperOptions), _b(units), _b(language), _b(task), max_tokens)
+        opts = _lib.WhisperOptions(ctypes.sizeof(_lib.WhisperOptions), _b(units), _b(language), _b(task), max_tokens, _b(device))
         _check(_library().dooms_whisper_open(ctypes.byref(paths), ctypes.byref(opts), ctypes.byref(self._h)))
 
     _require = staticmethod(LLM._require)
@@ -427,6 +428,12 @@ class Whisper(_Handle):
     def sample_rate(self) -> int:
         self._require_open()
         return int(_library().dooms_whisper_sample_rate(self._h))
+
+    @property
+    def device(self) -> str:
+        """Where the decoder runs: "gpu" or "cpu" (after device="auto", whether it fell back)."""
+        self._require_open()
+        return _library().dooms_whisper_device(self._h).decode()
 
     def transcribe(self, audio) -> str:
         """`audio`: a path, or 1-D float samples in [-1, 1] at sample_rate (mono)."""
@@ -494,10 +501,11 @@ class TTS(_Handle):
         audio = tts.synthesize("həlˈO wˈɜɹld.", voice="af_heart", speed=1.0, seed=0)   # phonemes directly
         tts.voices, tts.last_timings.rtf
 
-    The same seed gives the same samples (the vocoder's sine source draws its noise from it)."""
+    The same seed gives the same samples (the vocoder's sine source draws its noise from it). device: "auto" (default: the GPU, the CPU when there is
+    none), "gpu", "cpu" (also the environment variable DOOMS_DEVICE)."""
     _close = "dooms_tts_close"
 
-    def __init__(self, model_dir=None, *, prosody=None, f0n=None, model=None, units: Optional[str] = None):
+    def __init__(self, model_dir=None, *, prosody=None, f0n=None, model=None, units: Optional[str] = None, device: Optional[str] = None):
         super().__init__()
         self._require("dooms_tts_open")
         if model_dir is not None:
@@ -508,7 +516,7 @@ class TTS(_Handle):
         if not (prosody and f0n and model):
             raise ValueError("pass the model directory, or prosody=, f0n= and model=")
         paths = _lib.TtsPaths(ctypes.sizeof(_lib.TtsPaths), _b(prosody), _b(f0n), _b(model))
-        opts = _lib.TtsOptions(ctypes.sizeof(_lib.TtsOptions), _b(units))
+        opts = _lib.TtsOptions(ctypes.sizeof(_lib.TtsOptions), _b(units), _b(device))
         _check(_library().dooms_tts_open(ctypes.byref(paths), ctypes.byref(opts), ctypes.byref(self._h)))
         self._g2p = {}
 
@@ -518,6 +526,12 @@ class TTS(_Handle):
     def sample_rate(self) -> int:
         self._require_open()
         return int(_library().dooms_tts_sample_rate(self._h))
+
+    @property
+    def device(self) -> str:
+        """Where the vocoder runs: "gpu" or "cpu" (after device="auto", whether it fell back)."""
+        self._require_open()
+        return _library().dooms_tts_device(self._h).decode()
 
     @property
     def max_phonemes(self) -> int:

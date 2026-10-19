@@ -14,11 +14,12 @@ namespace {
 
 constexpr int kExitOk = 0, kExitFailed = 1, kExitUsage = 2;
 constexpr char kUsage[] =
-    "usage: dooms-cli speak --model DIR --phonemes TEXT --out FILE.wav [--voice NAME] [--speed S] [--seed N] [--units U] [--stats]\n"
+    "usage: dooms-cli speak --model DIR --phonemes TEXT --out FILE.wav [--voice NAME] [--speed S] [--seed N] [--units U] [--device D] [--stats]\n"
     "  --model DIR      prosody-fp32.mlpackage, f0n-fp32.mlpackage and kokoro.gguf from tools/convert/convert_kokoro.py\n"
     "  --phonemes TEXT  misaki's phonemes (the Python binding converts English text: dooms.TTS(...).speak(text))\n"
     "  --voice NAME     default af_heart (--voice list prints them)     --speed S  default 1     --seed N  the sine source's noise (default 0)\n"
-    "  --units U        the Core ML packages: cpu (default), cpu_gpu, all     --stats  print the timings to stderr\n";
+    "  --units U        the Core ML packages: cpu (default), cpu_gpu, all     --device D  the vocoder: auto (default), gpu, cpu\n"
+    "  --stats          print the timings to stderr\n";
 
 // 16-bit PCM mono WAV.
 bool write_wav(const std::string & path, const std::vector<float> & a, int32_t rate) {
@@ -55,6 +56,7 @@ int run_speak_command(int argc, char ** argv) {
         else if (flag == "--out") out = v;
         else if (flag == "--voice") voice = v;
         else if (flag == "--units") o.units = v;
+        else if (flag == "--device") o.device = v;
         else if (flag == "--speed") { speed = std::strtof(v, &end); if (end == v || *end || !(speed > 0.f)) { std::fprintf(stderr, "error: --speed must be > 0\n"); return kExitUsage; } }
         else if (flag == "--seed") { seed = std::strtoull(v, &end, 10); if (end == v || *end) { std::fprintf(stderr, "error: --seed must be a number\n"); return kExitUsage; } }
         else { std::fprintf(stderr, "error: unknown option '%s'\n%s", flag.c_str(), kUsage); return kExitUsage; }

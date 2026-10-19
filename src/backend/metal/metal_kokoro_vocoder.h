@@ -12,48 +12,29 @@
 #include <string>
 #include <vector>
 
-#include "core/dtype.h"
-#include "core/status.h"
+#include "backend/kokoro_vocoder.h"
 
 namespace dooms {
 
-struct KokoroTensor {
-    const void * data = nullptr;
-    DType dtype = DType::F32;
-    std::vector<int64_t> shape;   // outermost first (PyTorch's order)
-};
-using KokoroTensors = std::map<std::string, KokoroTensor>;   // the vocoder's "dec.*" tensors of kokoro.gguf (docs/formats/kokoro-gguf.md)
-
-struct KokoroVocoderConfig {
-    int32_t hidden = 0;                       // the decoder's input width (asr features): 512
-    int32_t style_dim = 0;                    // 128
-    int32_t n_fft = 0;                        // the generator's iSTFT size: its output has n_fft + 2 channels (20 -> 22)
-    std::vector<int32_t> upsample_rates;      // generator upsampling (10, 6)
-    std::vector<int32_t> upsample_kernels;    // (20, 12)
-    std::vector<int32_t> resblock_kernels;    // (3, 7, 11)
-    int32_t initial_channel = 0;              // 512
-    bool spin_wait = true;
-    bool tap_major = true;                    // the tap-major fast path for convolutions whose input width is a multiple of the step depth (false: generic only)
-};
-
 // Not thread-safe.
-class MetalKokoroVocoder {
+class MetalKokoroVocoder : public KokoroVocoder {
 public:
     //   Unsupported  no Metal device, an architecture this implementation does not cover     InvalidArgument  missing tensors or wrong shapes/dtypes
     static Result<std::unique_ptr<MetalKokoroVocoder>> create(const KokoroVocoderConfig & config, const KokoroTensors & tensors);
-    ~MetalKokoroVocoder();
+    ~MetalKokoroVocoder() override;
+    const char * device() const override { return "gpu"; }
     MetalKokoroVocoder(const MetalKokoroVocoder &) = delete;
     MetalKokoroVocoder & operator=(const MetalKokoroVocoder &) = delete;
 
     // frames F >= 1. asr [hidden][F], f0 and n [2F], style [style_dim] (the voice's first half), har [n_fft + 2][har_len] with har_len = 2F * prod(rates) + 1
     // (magnitudes then phases of the harmonic source's STFT). out: [n_fft + 2][har_len] row-major.
     //   InvalidArgument  sizes that do not fit, non-finite input     ResourceExhausted  buffers could not be allocated
-    Status run(const float * asr, int32_t frames, const float * f0, const float * n, const float * style, const float * har, std::vector<float> * out);
+    Status run(const float * asr, int32_t frames, const float * f0, const float * n, const float * style, const float * har, std::vector<float> * out) override;
 
-    int32_t har_length(int32_t frames) const;   // har_len for `frames`
+    int32_t har_length(int32_t frames) const override;
     // GPU time per kernel kind of the last run with profiling on (every dispatch in its own command buffer); empty otherwise.
-    void set_profiling(bool on);
-    const std::vector<std::pair<std::string, double>> & profile() const;
+    void set_profiling(bool on) override;
+    const std::vector<std::pair<std::string, double>> & profile() const override;
 
 private:
     struct Impl;

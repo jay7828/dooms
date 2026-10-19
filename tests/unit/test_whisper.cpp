@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "backend/metal/metal_whisper_decoder.h"
+#include "backend/whisper_text_decoder.h"
 #include "check.h"
 #include "format/gguf.h"
 #include "pipeline/audio_io.h"
@@ -94,7 +94,7 @@ TEST(every_stage_matches_transformers) {
         EXPECT(p.encode(mel, &states).is_ok());
         const double enc_err = rel_l2(states, want_enc);
         // 3. decoder on transformers' own encoder states
-        MetalWhisperDecoder & dec = p.decoder();
+        WhisperTextDecoder & dec = p.decoder();
         EXPECT(dec.set_audio(want_enc.data()).is_ok());
         for (size_t i = 0; i < prompt.size(); i++) EXPECT(dec.eval_token(prompt[i], i + 1 == prompt.size()).is_ok());
         const double logit_err = rel_l2(dec.logits().value(), want_logits);
@@ -155,7 +155,7 @@ TEST(suppression_masks_apply) {
     std::vector<int32_t> always = list("whisper.suppress_tokens"), begin = list("whisper.begin_suppress_tokens");
     EXPECT(!always.empty() && !begin.empty());
     WhisperPipeline & p = pipe.value();
-    MetalWhisperDecoder & dec = p.decoder();
+    WhisperTextDecoder & dec = p.decoder();
     const std::vector<float> states = tensor(ref.value(), "case0.encoder_out");
     const std::vector<int32_t> pr = p.prompt();
     auto run_prompt = [&]() {
@@ -226,7 +226,7 @@ TEST(prompt_batches_and_tunings_match_single_steps) {
     const std::vector<int32_t> generated = ints(tensor(ref.value(), "case0.generated"));
     // logits and greedy successor after `tokens`, one token per call or one prompt call
     auto run = [&](WhisperPipeline & p, const std::vector<int32_t> & tokens, bool batched, std::vector<float> * logits, int32_t * next) {
-        MetalWhisperDecoder & dec = p.decoder();
+        WhisperTextDecoder & dec = p.decoder();
         EXPECT(dec.set_audio(states.data()).is_ok());
         if (batched) EXPECT(dec.eval_prompt(tokens).is_ok());
         else for (size_t i = 0; i < tokens.size(); i++) EXPECT(dec.eval_token(tokens[i], i + 1 == tokens.size()).is_ok());
@@ -270,7 +270,7 @@ TEST(prompt_batches_and_tunings_match_single_steps) {
             }
         }
     }
-    MetalWhisperDecoder & dec = pipe.value().decoder();
+    WhisperTextDecoder & dec = pipe.value().decoder();
     EXPECT(dec.set_audio(states.data()).is_ok());
     EXPECT(dec.eval_prompt({}).code() == Code::InvalidArgument);
     EXPECT(dec.eval_prompt({-1}).code() == Code::InvalidArgument);

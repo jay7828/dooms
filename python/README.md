@@ -29,6 +29,7 @@ dooms.save_wav("hello.wav", tts.speak("Hello from dooms.cpp.", voice="af_heart")
 - `dooms.LLM`: chat templates, streaming, stop strings, seeded sampling, exact token counts (`last_generation`, `count_tokens`).
 - `dooms.VLM` (SmolVLM) and `dooms.VLA` (SmolVLA) open models converted locally with the repository's converters (`dooms pull smolvlm` in a source checkout).
 - `dooms.Whisper` (speech to text) and `dooms.TTS` (Kokoro-82M) run the files `dooms pull` downloads (converted, SHA-256 pinned, with the models' licences).
+- `device="auto"` (default: the GPU, the CPU when no Metal device can run the model), `"gpu"` or `"cpu"` on `LLM`, `Whisper` and `TTS`; also `DOOMS_DEVICE`.
 - `dooms serve`: `/v1/chat/completions`, `/v1/completions` (with streaming) and `/v1/models`, usable from the official `openai` client.
 
 The import name is `dooms`. Documentation: [docs/USING.md](https://github.com/jay7828/dooms/blob/main/docs/USING.md). Licence: Apache-2.0; each model keeps its own licence.

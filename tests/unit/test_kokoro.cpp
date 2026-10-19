@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "backend/cpu/cpu_kokoro_vocoder.h"
 #include "backend/metal/metal_kokoro_vocoder.h"
 #include "check.h"
 #include "format/gguf.h"
@@ -80,6 +81,8 @@ TEST(vocoder_arguments_are_validated) {
     c.hidden = 512; c.style_dim = 128; c.n_fft = 20; c.initial_channel = 512; c.upsample_rates = {10, 6}; c.upsample_kernels = {20, 12}; c.resblock_kernels = {3, 7, 11};
     auto v = MetalKokoroVocoder::create(c, {});
     EXPECT(!v.is_ok() && v.status().code() == Code::InvalidArgument);   // no tensors
+    auto cv = CpuKokoroVocoder::create(c, {});
+    EXPECT(!cv.is_ok() && cv.status().code() == Code::InvalidArgument);
 }
 
 TEST(vocoder_matches_pytorch) {

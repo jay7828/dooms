@@ -97,6 +97,8 @@ std::cout << llm.chat({{"user", "Name three colours."}}, 48) << "\n";
 
 See [docs/USING.md](docs/USING.md) for installation and the full API (LLM, VLM, VLA and the asynchronous runner, Whisper, TTS, the server, `dooms pull`).
 Models are not bundled in the package: `dooms pull` fetches them (Whisper and Kokoro as ready converted files, with their licences).
+Every model runs on the GPU by default; `device="cpu"` (or `DOOMS_DEVICE=cpu`, `--device cpu`) runs the LLM, Whisper and Kokoro on the CPU instead, and `"auto"`
+falls back to the CPU by itself when no Metal device can run them.
 
 ## Build
 ```

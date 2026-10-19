@@ -52,6 +52,11 @@ set_source_files_properties(src/backend/metal/metal_backend.mm src/backend/metal
 target_link_libraries(dooms_backend_metal PUBLIC dooms_ir "-framework Metal" "-framework Foundation")
 dooms_target(dooms_backend_metal)
 
+# the CPU implementations behind the Metal decoder/vocoder interfaces (the fallback and device "cpu"), and the device choice
+add_library(dooms_backend_cpu STATIC src/backend/cpu/cpu_whisper_decoder.cpp src/backend/cpu/cpu_kokoro_vocoder.cpp src/pipeline/device.cpp)
+target_link_libraries(dooms_backend_cpu PUBLIC dooms_core "-framework Accelerate")
+dooms_target(dooms_backend_cpu)
+
 # The Neural Engine is reachable only through Core ML (Apple only).
 add_library(dooms_coreml STATIC src/backend/coreml/coreml_model.mm)
 set_source_files_properties(src/backend/coreml/coreml_model.mm PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;objective-c++;-fobjc-arc")
@@ -78,16 +83,16 @@ dooms_target(dooms_vla)
 
 # speech to text: audio decoding (AudioToolbox), log-mel features (Accelerate), the Core ML encoder and the engine's own Metal decoder
 add_library(dooms_whisper STATIC src/pipeline/audio_io.cpp src/pipeline/whisper_features.cpp src/pipeline/whisper_pipeline.cpp)
-target_link_libraries(dooms_whisper PUBLIC dooms_backend_metal dooms_coreml dooms_format "-framework AudioToolbox" "-framework Accelerate" "-framework CoreFoundation")
+target_link_libraries(dooms_whisper PUBLIC dooms_backend_metal dooms_backend_cpu dooms_coreml dooms_format "-framework AudioToolbox" "-framework Accelerate" "-framework CoreFoundation")
 dooms_target(dooms_whisper)
 
 # text to speech: Kokoro's Core ML prosody packages, the host stages and the engine's Metal vocoder
 add_library(dooms_kokoro STATIC src/pipeline/kokoro_pipeline.cpp src/pipeline/kokoro_vocoder_loader.cpp)
-target_link_libraries(dooms_kokoro PUBLIC dooms_backend_metal dooms_coreml dooms_format)
+target_link_libraries(dooms_kokoro PUBLIC dooms_backend_metal dooms_backend_cpu dooms_coreml dooms_format)
 dooms_target(dooms_kokoro)
 
 add_library(dooms_llm STATIC src/pipeline/llm_pipeline.cpp)
-target_link_libraries(dooms_llm PUBLIC dooms_vlm_text dooms_core dooms_native_llama)
+target_link_libraries(dooms_llm PUBLIC dooms_vlm_text dooms_core dooms_native_llama dooms_backend_cpu)
 dooms_target(dooms_llm)
 
 add_library(dooms_vlm STATIC src/pipeline/vlm_pipeline.cpp)

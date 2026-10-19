@@ -77,6 +77,7 @@ typedef struct dooms_llm_options {
     int32_t n_ctx;        /* positions of the KV cache (prompt + answer); 0: 4096 */
     int32_t n_threads;    /* CPU threads, 0: default */
     int32_t n_gpu_layers; /* layers on the GPU; -1: all, 0: none */
+    const char * device;  /* appended: "auto" (NULL: the GPU, the CPU without one), "gpu", "cpu" (llama.cpp on the CPU); DOOMS_DEVICE overrides "auto" */
 } dooms_llm_options;
 
 /* How the next token is chosen. temperature 0 is greedy. top_k 0 and top_p 1 switch those filters off; repeat_penalty 1 is off. The same seed on the same inputs
@@ -254,6 +255,8 @@ typedef struct dooms_whisper_options {
     const char * language;     /* a code the model knows ("en", "de", ...); NULL: "en" */
     const char * task;         /* "transcribe" or "translate" (into English); NULL: "transcribe" */
     int32_t max_tokens;        /* text tokens per 30-s window, [1, 224]; 0: 224 */
+    const char * device;       /* appended: the decoder's device, "auto" (NULL: the GPU, the CPU without one), "gpu", "cpu"; with "cpu" the encoder runs on
+                                  the CPU too (its fp32 package when the model directory has one) */
 } dooms_whisper_options;
 
 typedef struct dooms_whisper_timings {
@@ -266,6 +269,7 @@ typedef struct dooms_whisper_timings {
 DOOMS_API dooms_code dooms_whisper_open(const dooms_whisper_paths * paths, const dooms_whisper_options * options, dooms_whisper ** out);
 DOOMS_API void dooms_whisper_close(dooms_whisper * whisper);
 DOOMS_API int32_t dooms_whisper_sample_rate(const dooms_whisper * whisper);   /* 16000; 0 for NULL */
+DOOMS_API const char * dooms_whisper_device(const dooms_whisper * whisper);  /* appended: where the decoder runs, "gpu" or "cpu"; NULL for NULL */
 /* n mono samples in [-1, 1] at dooms_whisper_sample_rate -> NUL-terminated UTF-8 text, with *needed and DOOMS_RESOURCE_EXHAUSTED as dooms_llm_generate. A text that
  * did not fit stays in the handle: dooms_whisper_last_text fetches it without transcribing again. */
 DOOMS_API dooms_code dooms_whisper_transcribe(dooms_whisper * whisper, const float * samples, size_t n, char * out, size_t capacity, size_t * needed);
@@ -290,6 +294,7 @@ typedef struct dooms_tts_paths {
 typedef struct dooms_tts_options {
     size_t struct_size;
     const char * units;    /* the Core ML packages' units: "cpu" (NULL: the default; fastest for their LSTMs), "cpu_gpu", "all" */
+    const char * device;   /* the vocoder: "auto" (NULL: the GPU, the CPU without one), "gpu", "cpu" */
 } dooms_tts_options;
 
 typedef struct dooms_tts_timings {
@@ -302,6 +307,7 @@ typedef struct dooms_tts_timings {
 DOOMS_API dooms_code dooms_tts_open(const dooms_tts_paths * paths, const dooms_tts_options * options, dooms_tts ** out);
 DOOMS_API void dooms_tts_close(dooms_tts * tts);
 DOOMS_API int32_t dooms_tts_sample_rate(const dooms_tts * tts);    /* 24000; 0 for NULL */
+DOOMS_API const char * dooms_tts_device(const dooms_tts * tts);    /* appended: where the vocoder runs, "gpu" or "cpu"; NULL for NULL */
 DOOMS_API int32_t dooms_tts_max_phonemes(const dooms_tts * tts);   /* per call; 0 for NULL */
 DOOMS_API int32_t dooms_tts_voice_count(const dooms_tts * tts);
 DOOMS_API const char * dooms_tts_voice_name(const dooms_tts * tts, int32_t index);   /* NULL outside [0, count); valid while the handle lives */

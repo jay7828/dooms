@@ -1,7 +1,7 @@
 // Whisper speech to text on the engine (Core ML encoder + the own Metal decoder): each --audio file is decoded once, then transcribed --warmup + --iters times;
 // p50 per stage, the real-time factor (processing time / audio duration) and the text. Audio file decoding is not timed (other engines' harnesses do the same).
 //
-//   bench_whisper --model DIR --audio FILE [--audio FILE]... [--units cpu_gpu|cpu_ne|all|cpu] [--warmup N] [--iters N] [--profile 1]
+//   bench_whisper --model DIR --audio FILE [--audio FILE]... [--units cpu_gpu|cpu_ne|all|cpu] [--device auto|gpu|cpu] [--warmup N] [--iters N] [--profile 1]
 //                 [--splits N] [--fused-ln -1|0|1]   decoder tuning (cross-attention position groups, 0 = automatic; LayerNorm placement, -1 = automatic)
 // --profile 1: on the first file, the fixed cost of a window (cross keys/values + the prompt, wall time) and one decode step's GPU time per kernel kind
 // (each dispatch in its own command buffer, summed over the layers, p50 of --iters steps).
@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "core/stats.h"
-#include "backend/metal/metal_whisper_decoder.h"
+#include "backend/whisper_text_decoder.h"
 #include "pipeline/audio_io.h"
 #include "pipeline/whisper_pipeline.h"
 
@@ -39,6 +39,7 @@ int main(int argc, char ** argv) {
         if (flag == "--model") model = value;
         else if (flag == "--audio") audio.emplace_back(value);
         else if (flag == "--units") wo.encoder_units = value;
+        else if (flag == "--device") wo.device = value;
         else if (flag == "--splits") wo.cross_splits = std::atoi(value);
         else if (flag == "--fused-ln") wo.fused_layernorm = std::atoi(value);
         else if (flag == "--warmup" || flag == "--iters" || flag == "--profile") {
@@ -55,7 +56,7 @@ int main(int argc, char ** argv) {
     auto p = WhisperPipeline::create({model + "/encoder-fp16.mlpackage", model + "/decoder.gguf"}, wo);
     if (!p.is_ok()) { std::fprintf(stderr, "error: %s\n", p.status().to_string().c_str()); return kExitFailed; }
     double all_ms = 0, all_audio = 0;
-    std::printf("encoder units %s, %d warm-up + %d timed runs per file\n", wo.encoder_units.c_str(), warmup, iters);
+    std::printf("decoder on the %s, encoder units %s, %d warm-up + %d timed runs per file\n", p.value().device(), wo.encoder_units.empty() ? "(default)" : wo.encoder_units.c_str(), warmup, iters);
     for (const std::string & path : audio) {
         auto samples = load_audio(path, p.value().sample_rate());
         if (!samples.is_ok()) { std::fprintf(stderr, "error: %s: %s\n", path.c_str(), samples.status().to_string().c_str()); return kExitFailed; }
@@ -87,7 +88,7 @@ int main(int argc, char ** argv) {
         const size_t n = std::min<size_t>(samples.value().size(), static_cast<size_t>(p.value().window_samples()));
         if (Status st = p.value().features(samples.value().data(), n, &mel); !st.is_ok()) { std::fprintf(stderr, "error: %s\n", st.to_string().c_str()); return kExitFailed; }
         if (Status st = p.value().encode(mel, &states); !st.is_ok()) { std::fprintf(stderr, "error: %s\n", st.to_string().c_str()); return kExitFailed; }
-        MetalWhisperDecoder & dec = p.value().decoder();
+        WhisperTextDecoder & dec = p.value().decoder();
         const std::vector<int32_t> pr = p.value().prompt();
         std::vector<double> cross_ms, prompt_ms;
         for (int it = 0; it < warmup + iters; it++) {

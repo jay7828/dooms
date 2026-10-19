@@ -2,6 +2,8 @@
  * the failure of every open call on missing files. The real-model behaviour is covered from Python (python/tests), except two parts that also run here through
  * C on real models: the asynchronous VLA runner when DOOMS_VLA_DIR names the converted SmolVLA files (CTest c_api_smolvla), and the LLM's token counts and
  * finish reasons when DOOMS_LLM_FILE names a chat-tuned GGUF (CTest c_api_llm). */
+#include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,6 +87,9 @@ int main(void) {
         lo.struct_size = sizeof lo;
         lo.n_ctx = 512;
         llm = NULL;
+        lo.device = "tpu";
+        CHECK(dooms_llm_open(getenv("DOOMS_LLM_FILE"), &lo, &llm) == DOOMS_INVALID_ARGUMENT && llm == NULL);
+        lo.device = NULL;
         CHECK(dooms_llm_open(getenv("DOOMS_LLM_FILE"), &lo, &llm) == DOOMS_OK);
         if (llm) {
             dooms_llm_generation_info gi;
@@ -301,6 +306,7 @@ int main(void) {
         CHECK(dooms_whisper_last_text(NULL, text, sizeof text, NULL) == DOOMS_INVALID_ARGUMENT);
         CHECK(dooms_whisper_sample_rate(NULL) == 0);
         dooms_whisper_close(NULL);
+        CHECK(dooms_whisper_device(NULL) == NULL);
         if (getenv("DOOMS_WHISPER_DIR") && *getenv("DOOMS_WHISPER_DIR") && getenv("DOOMS_WHISPER_CLIP")) {
             char enc[1024], dec[1024];
             snprintf(enc, sizeof enc, "%s/encoder-fp16.mlpackage", getenv("DOOMS_WHISPER_DIR"));
@@ -333,6 +339,25 @@ int main(void) {
                 memset(silence, 0, sizeof silence);
                 CHECK(dooms_whisper_transcribe(w, silence, 16000, text, sizeof text, &needed) == DOOMS_OK && strlen(text) + 1 == needed);
                 CHECK(dooms_whisper_last_timings(w, &wt) == DOOMS_OK && wt.audio_s == 1.0);
+                CHECK(dooms_whisper_device(w) && (!strcmp(dooms_whisper_device(w), "gpu") || !strcmp(dooms_whisper_device(w), "cpu")));
+                dooms_whisper_close(w);
+            }
+            wo.device = "tpu";
+            CHECK(dooms_whisper_open(&wp, &wo, &w) == DOOMS_INVALID_ARGUMENT && w == NULL);
+            /* a caller built before the field: struct_size stops before it, so it is never read */
+            wo.struct_size = offsetof(dooms_whisper_options, device);
+            CHECK(dooms_whisper_open(&wp, &wo, &w) == DOOMS_OK);
+            dooms_whisper_close(w);
+            /* forced onto the CPU: the same words as the default device on this clip */
+            wo.struct_size = sizeof wo;
+            wo.device = "cpu";
+            CHECK(dooms_whisper_open(&wp, &wo, &w) == DOOMS_OK);
+            if (w) {
+                char cpu_text[4096];
+                CHECK(!strcmp(dooms_whisper_device(w), "cpu"));
+                CHECK(dooms_whisper_transcribe_file(w, getenv("DOOMS_WHISPER_CLIP"), cpu_text, sizeof cpu_text, NULL) == DOOMS_OK);
+                CHECK(dooms_whisper_last_text(w, text, sizeof text, NULL) == DOOMS_OK && !strcmp(cpu_text, text) && strlen(cpu_text) > 10);
+                printf("        whisper on the CPU: \"%s\"\n", cpu_text);
                 dooms_whisper_close(w);
             }
         }
@@ -357,6 +382,7 @@ int main(void) {
         CHECK(dooms_tts_synthesize(NULL, "a", "af_heart", 1.f, 0, small, 8, NULL) == DOOMS_INVALID_ARGUMENT);
         CHECK(dooms_tts_sample_rate(NULL) == 0 && dooms_tts_voice_count(NULL) == 0 && dooms_tts_voice_name(NULL, 0) == NULL);
         dooms_tts_close(NULL);
+        CHECK(dooms_tts_device(NULL) == NULL);
         if (getenv("DOOMS_TTS_DIR") && *getenv("DOOMS_TTS_DIR")) {
             char p1[1024], p2[1024], p3[1024];
             float * audio;
@@ -380,8 +406,31 @@ int main(void) {
                 tt.struct_size = sizeof tt;
                 CHECK(dooms_tts_last_timings(t, &tt) == DOOMS_OK && tt.frames * 600 == (int32_t) needed && tt.total_ms > 0 && tt.vocoder_ms > 0);
                 printf("        tts: %.2f s of audio in %.0f ms\n", tt.audio_s, tt.total_ms);
-                free(audio);
                 dooms_tts_close(t);
+                /* the CPU vocoder: same length, samples within a small fraction of the default device's */
+                {
+                    dooms_tts_options to;
+                    memset(&to, 0, sizeof to);
+                    to.struct_size = sizeof to;
+                    to.device = "tpu";
+                    CHECK(dooms_tts_open(&tp, &to, &t) == DOOMS_INVALID_ARGUMENT && t == NULL);
+                    to.device = "cpu";
+                    CHECK(dooms_tts_open(&tp, &to, &t) == DOOMS_OK);
+                    if (t) {
+                        float * cpu = (float *) malloc(needed * sizeof(float));
+                        size_t got = 0, i;
+                        double num = 0, den = 0;
+                        CHECK(!strcmp(dooms_tts_device(t), "cpu"));
+                        CHECK(cpu && dooms_tts_synthesize(t, "h\xC9\x99l\xCB\x88O w\xCB\x88\xC9\x9C\xC9\xB9ld.", dooms_tts_voice_name(t, 0), 1.f, 7, cpu, needed, &got) == DOOMS_OK);
+                        CHECK(got == needed);
+                        for (i = 0; cpu && i < got; ++i) { num += (cpu[i] - audio[i]) * (double) (cpu[i] - audio[i]); den += audio[i] * (double) audio[i]; }
+                        CHECK(den > 0 && sqrt(num / den) < 0.05);
+                        printf("        tts on the CPU: relative L2 %.2e vs the default device\n", den > 0 ? sqrt(num / den) : -1.0);
+                        free(cpu);
+                        dooms_tts_close(t);
+                    }
+                }
+                free(audio);
             }
         }
     }

@@ -13,11 +13,12 @@ namespace {
 
 constexpr int kExitOk = 0, kExitFailed = 1, kExitUsage = 2;
 constexpr char kUsage[] =
-    "usage: dooms-cli transcribe --model DIR --audio FILE [--audio FILE]... [--language CODE] [--task transcribe|translate] [--units U] [--max-tokens N] [--stats]\n"
+    "usage: dooms-cli transcribe --model DIR --audio FILE [--audio FILE]... [--language CODE] [--task transcribe|translate] [--units U] [--device D] [--max-tokens N] [--stats]\n"
     "  --model DIR     encoder-fp16.mlpackage + decoder.gguf from tools/convert/convert_whisper.py\n"
     "  --audio FILE    any file Core Audio decodes (WAV, MP3, M4A, FLAC, ...); one line of text per file\n"
     "  --language      a code the model knows (default en)     --task  transcribe (default) or translate (into English)\n"
-    "  --units U       the encoder's Core ML units: cpu_gpu (default), cpu_ne, all, cpu\n"
+    "  --units U       the encoder's Core ML units: cpu_gpu (default with the GPU), cpu_ne, all, cpu (default with --device cpu)\n"
+    "  --device D      the decoder: auto (default: the GPU, the CPU without one), gpu, cpu\n"
     "  --max-tokens N  text tokens per 30-s window (default 224)     --stats  print the timings to stderr\n";
 
 struct Args {
@@ -39,6 +40,7 @@ Result<Args> parse(int argc, char ** argv) {
         else if (flag == "--language") a.options.language = value;
         else if (flag == "--task") a.options.task = value;
         else if (flag == "--units") a.options.encoder_units = value;
+        else if (flag == "--device") a.options.device = value;
         else if (flag == "--max-tokens") {
             char * end = nullptr;
             const long v = std::strtol(value, &end, 10);

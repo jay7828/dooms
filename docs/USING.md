@@ -34,6 +34,12 @@ audio = tts.synthesize("həlˈO wˈɜɹld.", voice="bm_george", speed=1.1, seed=
 `temperature=0` (default) is greedy and deterministic; above 0 tokens are drawn with a seeded generator (`seed`, `top_k`, `top_p`, `repeat_penalty`). `stop=[...]` ends the text before a
 string. Each call is a fresh conversation. Errors raise `dooms.DoomsError` (`.code` is `NotFound`, `InvalidArgument`, ...). llama.cpp's loading log is silent; `DOOMS_LOG=info` shows it.
 
+**Device.** `LLM`, `Whisper` and `TTS` take `device="auto"` (default: the GPU, and the CPU when no Metal device can run the model), `"gpu"` (an error instead of the
+fallback) or `"cpu"`; the environment variable `DOOMS_DEVICE` sets it for "auto" (also for the C API's `device` fields and the CLIs' `--device`). `stt.device` /
+`tts.device` say where the decoder / vocoder ended up. On the CPU the results stay correct (f32; the same text) but slower: whisper-tiny ~5x and Kokoro ~3x the
+GPU's time. Whisper on the CPU uses `encoder-fp32.mlpackage` next to the model when present; for large-v3-turbo write it with
+`tools/convert/convert_whisper.py --model <snapshot> --only-cpu-encoder` (2.4 GB; the prebuilt download does not include it), otherwise punctuation can differ.
+
 ## C++
 
 ```
@@ -59,6 +65,7 @@ dooms-cli llm --model model.gguf --raw --prompt "Once upon a time" --temp 0.8 --
 dooms-cli vlm --image photo.jpg --prompt "Describe this image." --models models/smolvlm
 dooms-cli transcribe --model ~/.cache/dooms/whisper-large-v3-turbo --audio speech.wav --stats
 dooms-cli speak --model ~/.cache/dooms/kokoro --phonemes "həlˈO wˈɜɹld." --voice af_heart --out hello.wav --stats
+dooms-cli transcribe --model ~/.cache/dooms/whisper-tiny --audio speech.wav --device cpu     # every command: --device auto|gpu|cpu
 ```
 
 ## OpenAI-compatible server

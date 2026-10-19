@@ -14,12 +14,13 @@ namespace {
 constexpr int kExitOk = 0, kExitFailed = 1, kExitUsage = 2;
 constexpr char kUsage[] =
     "usage: dooms-cli llm --model FILE.gguf --prompt TEXT [--system TEXT] [--raw] [--max-tokens N] [--ctx N] [--temp T] [--top-k K] [--top-p P] [--repeat-penalty R]\n"
-    "                     [--seed N] [--stop STRING]... [--threads N] [--stats]\n"
+    "                     [--seed N] [--stop STRING]... [--threads N] [--device D] [--stats]\n"
     "  --prompt        the user message; it is wrapped in the model's chat template unless --raw (then it is continued as plain text)\n"
     "  --system        a system message (chat mode)\n"
     "  --max-tokens N  answer length limit (default 256)     --ctx N  context positions (default 4096)\n"
     "  --temp T        0 = greedy (default); above 0 samples with --top-k (40), --top-p (0.95), --repeat-penalty (1) and --seed (0)\n"
-    "  --stop STRING   end the answer before this string (repeatable)     --stats  print the timings to stderr\n";
+    "  --stop STRING   end the answer before this string (repeatable)     --stats  print the timings to stderr\n"
+    "  --device D      auto (default), gpu, cpu (llama.cpp on the CPU)\n";
 
 struct Args {
     std::string model, prompt, system;
@@ -49,6 +50,7 @@ Result<Args> parse(int argc, char ** argv) {
         else if (flag == "--prompt") a.prompt = value;
         else if (flag == "--system") a.system = value;
         else if (flag == "--stop") a.gen.stop.emplace_back(value);
+        else if (flag == "--device") a.options.device = value;
         else {
             double lo = 0, hi = 0;
             if (flag == "--max-tokens") { lo = 1; hi = 1 << 20; }

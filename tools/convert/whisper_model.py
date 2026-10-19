@@ -55,8 +55,9 @@ class Encoder(torch.nn.Module):
         return self.enc(x).last_hidden_state
 
 
-def convert_encoder(model, out_path: str, compute_units: str = "gpu", max_rel_l2: float = 2e-2, seed: int = 0) -> float:
-    """Writes the fp16 Core ML package (only if its output on `compute_units` is within max_rel_l2 of PyTorch fp32 on random features); returns the error."""
+def convert_encoder(model, out_path: str, compute_units: str = "gpu", max_rel_l2: float = 2e-2, seed: int = 0, precision: str = "fp16") -> float:
+    """Writes the Core ML package in `precision` (fp16, or fp32 for the CPU: the CPU computes an fp16 package in half precision, 0.18 relative L2 for
+    large-v3-turbo's 32 layers) only if its output on `compute_units` is within max_rel_l2 of PyTorch fp32 on random features; returns the error."""
     import coremltools as ct  # noqa: PLC0415
     c = model.config
     torch.manual_seed(seed)
@@ -66,7 +67,7 @@ def convert_encoder(model, out_path: str, compute_units: str = "gpu", max_rel_l2
         ref = enc(x)
         traced = torch.jit.trace(enc, x)
     mlm = ct.convert(traced, inputs=[ct.TensorType(name=ENC_INPUT, shape=tuple(x.shape))], outputs=[ct.TensorType(name=ENC_OUTPUT)], convert_to="mlprogram",
-                     minimum_deployment_target=ct.target.macOS14, compute_precision=ct.precision.FLOAT16)
+                     minimum_deployment_target=ct.target.macOS14, compute_precision=ct.precision.FLOAT16 if precision == "fp16" else ct.precision.FLOAT32)
     tmp = out_path + ".tmp.mlpackage"
     if os.path.exists(tmp):
         import shutil  # noqa: PLC0415
