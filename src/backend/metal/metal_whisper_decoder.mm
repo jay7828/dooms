@@ -43,9 +43,9 @@ struct GemmParams { uint32_t K, N, M, x_stride, y_stride, flags; float eps; };
 struct AttnParams { uint32_t n_head, n_head_kv, head_dim, qkv_stride, kv_stride, out_stride, p0, fused_rope, neox; float scale, base; };
 struct EmbedParams { uint32_t n_embd, token_index, pos, use_pos; };
 struct ArgmaxParams { uint32_t n, out_index, use_mask; };
-struct SplitParams { uint32_t n_head, head_dim, q_stride, kv_stride, n_keys, chunk, n_split, out_stride; float scale; };
+struct SplitParams { uint32_t n_head, head_dim, q_stride, kv_stride, n_keys, chunk, n_split, out_stride; float scale; uint32_t group; };
 static_assert(sizeof(MatvecParams) == 16 && sizeof(GemmParams) == 28 && sizeof(AttnParams) == 44 && sizeof(EmbedParams) == 16 && sizeof(ArgmaxParams) == 12 &&
-                  sizeof(SplitParams) == 36,
+                  sizeof(SplitParams) == 40,
               "parameter structs must match the kernel source field for field");
 
 std::string describe(NSError * e) { return e ? std::string([[e localizedDescription] UTF8String]) : std::string("unknown error"); }
@@ -206,7 +206,7 @@ struct MetalWhisperDecoder::Impl {
     void cross_attention(size_t cache_off, uint32_t M) {
         const uint32_t nh = static_cast<uint32_t>(cfg.n_head), d = static_cast<uint32_t>(cfg.n_state), A = static_cast<uint32_t>(cfg.n_audio_ctx);
         const uint32_t chunk = (A + cross_splits - 1) / cross_splits;
-        SplitParams sp{nh, hd, d, d, A, chunk, cross_splits, d, 1.f / std::sqrt(static_cast<float>(hd))};
+        SplitParams sp{nh, hd, d, d, A, chunk, cross_splits, d, 1.f / std::sqrt(static_cast<float>(hd)), 1};
         [enc_ setComputePipelineState:p_attn_split];
         [enc_ setBuffer:q offset:0 atIndex:0];
         [enc_ setBuffer:ck offset:cache_off atIndex:1];

@@ -72,10 +72,13 @@ window.DOOMS = {
       { sys: "pytorch", name: "PyTorch MPS fp16", tps: 37.6 },
     ],
     // 4-bit rows are a different precision: shown apart, never ranked against f16
+    // Q4_0 (pure, 271 MB) is MLX-LM 4-bit's size (mlx-community, 265 MB); Q4_K_M (379 MB) is llama.cpp's default mix (scripts/reproduce-4bit.sh, 2026-10-22)
     decode4: [
-      { sys: "mlx", name: "MLX-LM 4-bit", tps: 211.6 },
-      { sys: "llama", name: "llama.cpp Q4_K_M", tps: 164.9 },
-      { sys: "dooms", name: "dooms.cpp Q4_K_M (llama.cpp inside)", tps: 161.5 },
+      { sys: "dooms", name: "dooms.cpp Q4_0, own decoder", tps: 256.1 },
+      { sys: "llama", name: "llama.cpp Q4_0", tps: 238.7 },
+      { sys: "mlx", name: "MLX-LM 4-bit (mlx-community)", tps: 224.3 },
+      { sys: "dooms", name: "dooms.cpp Q4_K_M, own decoder", tps: 209.2 },
+      { sys: "llama", name: "llama.cpp Q4_K_M", tps: 165.3 },
     ],
     prefill: [
       { sys: "llama", name: "llama.cpp f16", tps: 4604 },

@@ -2,11 +2,14 @@
 // Always: a small random Llama (grouped-query attention, two layers) against an independent double-precision reference written here (same f16 weights, keys
 // and values rounded to f16 like the decoder's cache): logits after a prompt, greedy tokens over a generation, chunked prefill, token vs embedding input,
 // queue depth, stop semantics, position accounting and argument errors.
+// Quantized matrices (q4_0, q5_0, q8_0, q4_K, q6_K and a Q4_K_M-like mix): random blocks dequantized by ggml itself into the same reference.
 // Opt-in (DOOMS_VLM_DIR with text-f16.gguf, vlm-config.gguf, reference.gguf): SmolVLM's text model against llama.cpp (TextDecoder) and transformers.
+// Opt-in (DOOMS_QWEN_F16 / DOOMS_QWEN_GGUF): Qwen2.5-0.5B against llama.cpp on the same file (f16, or a quantized one such as Q4_K_M).
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -14,6 +17,7 @@
 #include "backend/metal/metal_llama_decoder.h"
 #include "check.h"
 #include "format/gguf.h"
+#include "ggml.h"
 #include "models/vlm/text_decoder.h"
 #include "pipeline/native_llama.h"
 
@@ -197,6 +201,111 @@ double rel_l2(const std::vector<float> & a, const std::vector<double> & b) {
 
 const std::vector<int32_t> kPrompt = {3, 17, 42, 8, 8, 21, 0, 49, 12, 30, 5};
 
+// ---- Quantized matrices ----
+// Random ggml blocks with power-of-two scales, so every dequantized value is exact in f16 (asserted): the double reference then sees exactly the weights the
+// GPU reads, and any difference is the kernels'. ggml's own to_float dequantizes (independent of the Metal code).
+struct QuantMat {
+    DType dt;
+    std::vector<uint8_t> bytes;
+    std::vector<__fp16> values;   // ggml's dequantization, row-major [rows][cols]
+};
+
+ggml_type ggml_of(DType t) {
+    switch (t) {
+        case DType::Q4_0: return GGML_TYPE_Q4_0;
+        case DType::Q5_0: return GGML_TYPE_Q5_0;
+        case DType::Q8_0: return GGML_TYPE_Q8_0;
+        case DType::Q4_K: return GGML_TYPE_Q4_K;
+        case DType::Q6_K: return GGML_TYPE_Q6_K;
+        default: return GGML_TYPE_F16;
+    }
+}
+
+void put_half(uint8_t * p, float v) { const __fp16 h = static_cast<__fp16>(v); std::memcpy(p, &h, 2); }
+
+QuantMat random_quant(std::mt19937 & rng, DType dt, int64_t rows, int64_t cols, bool * exact) {
+    QuantMat q{dt, {}, {}};
+    const int64_t nb = rows * cols / dtype_block_elems(dt), bb = dtype_block_bytes(dt);
+    q.bytes.resize(static_cast<size_t>(nb * bb));
+    std::uniform_int_distribution<int> byte(0, 255), sc6(-63, 63);
+    for (int64_t b = 0; b < nb; b++) {
+        uint8_t * p = q.bytes.data() + b * bb;
+        for (int64_t i = 0; i < bb; i++) p[i] = static_cast<uint8_t>(byte(rng));
+        switch (dt) {   // the scales: powers of two sized for weights of std ~0.14 (block layouts: core/dtype.cpp)
+            case DType::Q4_0: put_half(p, 1.f / 32); break;
+            case DType::Q5_0: put_half(p, 1.f / 64); break;
+            case DType::Q8_0: put_half(p, 1.f / 512); break;
+            case DType::Q4_K: put_half(p, 1.f / 1024); put_half(p + 2, 1.f / 1024); break;   // 6-bit scales and mins stay random
+            case DType::Q6_K:
+                for (int i = 0; i < 16; i++) p[192 + i] = static_cast<uint8_t>(static_cast<int8_t>(sc6(rng)));   // |scale| <= 63: |scale * q| < 2048, exact in f16
+                put_half(p + 208, 1.f / 4096);
+                break;
+            default: break;
+        }
+    }
+    std::vector<float> f(static_cast<size_t>(rows * cols));
+    ggml_get_type_traits(ggml_of(dt))->to_float(q.bytes.data(), f.data(), rows * cols);
+    q.values.resize(f.size());
+    for (size_t i = 0; i < f.size(); i++) {
+        q.values[i] = static_cast<__fp16>(f[i]);
+        if (static_cast<float>(q.values[i]) != f[i]) *exact = false;
+    }
+    return q;
+}
+
+struct QuantPlan { const char * name; DType embd, output, q, k, v, wo, gate, down0, down1; };
+
+struct QuantTiny {
+    TinyModel ref;   // the dequantized values (for Reference)
+    std::vector<QuantMat> mats;
+    LlamaDecoderWeights w;
+};
+
+// A qwen2-style tiny model with every matrix quantized as the plan says (widths multiples of 256 for the K types; n_ff above kMaxStagedInput).
+QuantTiny make_quant(const QuantPlan & plan, uint32_t seed, bool * exact) {
+    QuantTiny t;
+    LlamaDecoderConfig & c = t.ref.cfg;
+    c.n_layer = 2; c.n_embd = 256; c.n_head = 4; c.n_head_kv = 2; c.head_dim = 64; c.n_ff = 2304; c.n_vocab = 50;
+    c.rope_base = 10000.f; c.rms_eps = 1e-5f; c.n_ctx = 128; c.n_batch = 64; c.rope_neox = true;
+    std::mt19937 rng(seed);
+    const int64_t E = 256, F = 2304, V = 50, Q = 256, KV = 128;
+    t.mats.reserve(64);   // stable addresses for the WeightRefs
+    auto mat = [&](DType dt, int64_t rows, int64_t cols) -> const QuantMat & { t.mats.push_back(random_quant(rng, dt, rows, cols, exact)); return t.mats.back(); };
+    auto ref = [](const QuantMat & m, int64_t rows, int64_t cols) { return WeightRef{m.bytes.data(), m.dt, rows, cols}; };
+    const QuantMat & embd = mat(plan.embd, V, E);
+    const QuantMat & out = mat(plan.output, V, E);
+    t.ref.embd = embd.values;
+    t.ref.output = out.values;
+    t.ref.output_norm = random_norm(rng, E);
+    t.w.token_embd = ref(embd, V, E);
+    t.w.output = ref(out, V, E);
+    t.w.output_norm = {t.ref.output_norm.data(), DType::F32, 1, E};
+    t.ref.layers.resize(2);
+    for (int l = 0; l < 2; l++) {
+        TinyModel::Layer & L = t.ref.layers[static_cast<size_t>(l)];
+        L.attn_norm = random_norm(rng, E);
+        L.ffn_norm = random_norm(rng, E);
+        std::normal_distribution<float> d(0.f, 0.3f);
+        for (int64_t i = 0; i < Q + 2 * KV; i++) L.qkv_bias.push_back(d(rng));
+        const QuantMat & mq = mat(plan.q, Q, E), & mk = mat(plan.k, KV, E), & mv = mat(plan.v, KV, E);
+        L.qkv = mq.values;
+        L.qkv.insert(L.qkv.end(), mk.values.begin(), mk.values.end());
+        L.qkv.insert(L.qkv.end(), mv.values.begin(), mv.values.end());
+        const QuantMat & mo = mat(plan.wo, E, Q), & mg = mat(plan.gate, F, E), & mu = mat(plan.gate, F, E), & md = mat(l == 0 ? plan.down0 : plan.down1, E, F);
+        L.wo = mo.values; L.gate = mg.values; L.up = mu.values; L.down = md.values;
+        LlamaLayerWeights lw;
+        lw.attn_norm = {L.attn_norm.data(), DType::F32, 1, E};
+        lw.ffn_norm = {L.ffn_norm.data(), DType::F32, 1, E};
+        lw.attn_q = ref(mq, Q, E); lw.attn_k = ref(mk, KV, E); lw.attn_v = ref(mv, KV, E);
+        lw.attn_q_bias = {L.qkv_bias.data(), DType::F32, 1, Q};
+        lw.attn_k_bias = {L.qkv_bias.data() + Q, DType::F32, 1, KV};
+        lw.attn_v_bias = {L.qkv_bias.data() + Q + KV, DType::F32, 1, KV};
+        lw.attn_output = ref(mo, E, Q); lw.ffn_gate = ref(mg, F, E); lw.ffn_up = ref(mu, F, E); lw.ffn_down = ref(md, E, F);
+        t.w.layers.push_back(lw);
+    }
+    return t;
+}
+
 }  // namespace
 
 TEST(prompt_logits_and_greedy_generation_match_the_reference) {
@@ -267,6 +376,89 @@ TEST(qwen_style_block_matches_the_reference) {
     LlamaDecoderWeights w = weights_of(m);
     w.layers[0].attn_k_bias = WeightRef();
     EXPECT(!MetalLlamaDecoder::create(m.cfg, w).is_ok());
+}
+
+// Every quantized type, alone and mixed like a Q4_K_M file (q/k in q5_0 and v in q8_0: separate q/k/v dispatches; the down projections in q4_K and q6_K):
+// one token per call (the matvec kernels, f32 activations on exact weights) within 1e-4 of the double reference, the prompt in one call (dequantized to half,
+// the prefill matmuls; both tile kernels) within 3e-3, and the greedy tokens of a generation equal.
+TEST(quantized_matrices_match_the_reference) {
+    const DType F16 = DType::F16, Q40 = DType::Q4_0, Q50 = DType::Q5_0, Q80 = DType::Q8_0, Q4K = DType::Q4_K, Q6K = DType::Q6_K;
+    (void)F16;
+    for (const QuantPlan & plan : {QuantPlan{"q4_0", Q40, Q40, Q40, Q40, Q40, Q40, Q40, Q40, Q40}, QuantPlan{"q5_0", Q50, Q50, Q50, Q50, Q50, Q50, Q50, Q50, Q50},
+                                   QuantPlan{"q8_0", Q80, Q80, Q80, Q80, Q80, Q80, Q80, Q80, Q80}, QuantPlan{"q4_K", Q4K, Q4K, Q4K, Q4K, Q4K, Q4K, Q4K, Q4K, Q4K},
+                                   QuantPlan{"q6_K", Q6K, Q6K, Q6K, Q6K, Q6K, Q6K, Q6K, Q6K, Q6K},
+                                   QuantPlan{"Q4_K_M-like mix", Q80, Q6K, Q50, Q50, Q80, Q50, Q50, Q4K, Q6K}}) {
+        bool exact = true;
+        const QuantTiny qt = make_quant(plan, 11, &exact);
+        EXPECT(exact);   // the reference's f16 weights are ggml's values exactly
+        for (int tile : {1, 2}) {
+            LlamaDecoderConfig cfg = qt.ref.cfg;
+            cfg.prefill_tile = tile;
+            auto dec = MetalLlamaDecoder::create(cfg, qt.w);
+            EXPECT(dec.is_ok());
+            if (!dec.is_ok()) { std::printf("        %s: %s\n", plan.name, dec.status().to_string().c_str()); break; }
+            MetalLlamaDecoder & d = *dec.value();
+            Reference ref(qt.ref);
+            std::vector<double> want;
+            for (int32_t t : kPrompt) want = ref.step(ref.embedding(t));
+            EXPECT(d.eval_tokens(kPrompt).is_ok());
+            const double batched = rel_l2(d.logits().value(), want);
+            EXPECT(batched < 3e-3);
+            EXPECT_EQ(d.pending_token().value(), argmax(want));
+            d.reset();
+            for (int32_t t : kPrompt) EXPECT(d.eval_tokens({t}).is_ok());
+            const double single = rel_l2(d.logits().value(), want);
+            EXPECT(single < 1e-4);
+            std::vector<int32_t> want_tokens;
+            int32_t t = argmax(want);
+            for (int i = 0; i < 16; i++) { want_tokens.push_back(t); t = argmax(ref.step(ref.embedding(t))); }
+            std::vector<int32_t> got;
+            EXPECT(d.generate(16, 2, [&](int32_t tok) { got.push_back(tok); return true; }).is_ok());
+            EXPECT(got == want_tokens);
+            if (tile == 1 || batched >= 3e-3) {
+                std::printf("        %-16s prompt logits relative L2: %.2e one token per call, %.2e in one call (tile %d); %zu greedy tokens %s\n", plan.name, single,
+                            batched, tile, got.size(), got == want_tokens ? "equal" : "DIFFERENT");
+            }
+        }
+    }
+    // A row that is not a whole number of blocks, and gate/up of different types, are refused.
+    bool exact = true;
+    QuantTiny qt = make_quant(QuantPlan{"x", Q40, Q40, Q40, Q40, Q40, Q40, Q40, Q40, Q40}, 12, &exact);
+    LlamaDecoderWeights w = qt.w;
+    w.layers[1].ffn_up.dtype = Q80;
+    EXPECT(MetalLlamaDecoder::create(qt.ref.cfg, w).status().code() == Code::Unsupported);
+}
+
+// Decode steps from 512 positions on attend through attention_split + attention_combine (the cache split into chunks over many threadgroups); both rotary
+// layouts, grouped-query attention, against the reference: the logits of each step and the greedy tokens.
+TEST(long_context_decode_matches_the_reference) {
+    for (bool qwen : {false, true}) {
+        const TinyModel m = make_tiny(qwen ? 21 : 22, 64, 600, qwen, 64);
+        auto dec = MetalLlamaDecoder::create(m.cfg, weights_of(m));
+        EXPECT(dec.is_ok());
+        if (!dec.is_ok()) { std::printf("        %s\n", dec.status().to_string().c_str()); return; }
+        MetalLlamaDecoder & d = *dec.value();
+        Reference ref(m);
+        std::vector<int32_t> prompt;
+        for (int i = 0; i < 520; i++) prompt.push_back((i * 7 + 3) % m.cfg.n_vocab);
+        std::vector<double> want;
+        for (int32_t t : prompt) want = ref.step(ref.embedding(t));
+        EXPECT(d.eval_tokens(prompt).is_ok());
+        // One token per call from position 520 on: each step's logits against the reference (f32 activations: close), greedy tokens fed back.
+        double worst = 0;
+        int32_t t = argmax(want);
+        bool same = true;
+        for (int i = 0; i < 24; i++) {
+            want = ref.step(ref.embedding(t));
+            EXPECT(d.eval_tokens({t}).is_ok());
+            worst = std::max(worst, rel_l2(d.logits().value(), want));
+            same = same && d.pending_token().value() == argmax(want);
+            t = argmax(want);
+        }
+        std::printf("        %s, positions 520..543: worst logits relative L2 %.2e, greedy tokens %s\n", qwen ? "qwen-style" : "llama", worst, same ? "equal" : "DIFFERENT");
+        EXPECT(worst < 3e-3);   // the 520-token prompt went through the half-rounded prefill matmuls
+        EXPECT(same);
+    }
 }
 
 // Both prefill kernels (16x16 tiles, 64-row x 32-token tiles) on a 45-token prompt (not a multiple of either tile) against the reference, llama and qwen
@@ -389,11 +581,14 @@ TEST(loader_refuses_what_it_cannot_run) {
     EXPECT(load_native_llama("/nonexistent/model.gguf", o).status().code() == Code::InvalidArgument);
     const char * dir = std::getenv("DOOMS_VLM_DIR");
     if (!dir) return;
-    // A quantized file is a valid model the Metal decoder does not run: Unsupported, so callers fall back to llama.cpp.
+    // A quantized file of the supported block types loads (the Q4_K_M one mixes q5_0, q8_0, q4_K and q6_K); other types stay Unsupported (the callers then
+    // fall back to llama.cpp).
     const std::string q = std::string(dir) + "/text-Q4_K_M.gguf";
     if (FILE * f = std::fopen(q.c_str(), "rb")) {
         std::fclose(f);
-        EXPECT(load_native_llama(q).status().code() == Code::Unsupported);
+        auto r = load_native_llama(q);
+        EXPECT(r.is_ok() || r.status().code() == Code::Unsupported);
+        if (!r.is_ok()) std::printf("        %s\n", r.status().to_string().c_str());
     }
 }
 
@@ -460,8 +655,8 @@ TEST(smolvlm_text_model_matches_llama_cpp_and_transformers) {
 // Qwen2.5-0.5B (f16 GGUF, DOOMS_QWEN_F16): logits against llama.cpp on a chat prompt, and llama.cpp's own greedy continuation teacher-forced: each of
 // its tokens must be our argmax within a hair (f16 noise can swap near-ties in a free-running comparison).
 TEST(qwen2_matches_llama_cpp) {
-    const char * path = std::getenv("DOOMS_QWEN_F16");
-    if (!path) { std::printf("        (skipped: set DOOMS_QWEN_F16)\n"); return; }
+    const char * path = std::getenv("DOOMS_QWEN_GGUF") ? std::getenv("DOOMS_QWEN_GGUF") : std::getenv("DOOMS_QWEN_F16");
+    if (!path) { std::printf("        (skipped: set DOOMS_QWEN_F16 or DOOMS_QWEN_GGUF)\n"); return; }
     NativeLlamaOptions no;
     no.n_ctx = 512;
     auto native = load_native_llama(path, no);

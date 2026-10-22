@@ -179,13 +179,23 @@ TEST(text_engine_selection_and_fallback) {
     const std::string q = dir + "/text-Q4_K_M.gguf";
     if (FILE * fp = std::fopen(q.c_str(), "rb")) {
         std::fclose(fp);
+        // The quantized text model (q5_0 / q8_0 / q4_K / q6_K matrices) runs on the own decoder too ("auto"); "llama.cpp" still forces llama.cpp.
         const VlmPaths quant{f16.vision, q, f16.config};
-        auto pipe = VlmPipeline::create(quant);
-        EXPECT(pipe.is_ok());
-        if (pipe.is_ok()) EXPECT_EQ(std::string(pipe.value().text_engine_used()), std::string("llama.cpp"));
-        VlmOptions mo;
-        mo.text_engine = "metal";
-        EXPECT(VlmPipeline::create(quant, mo).status().code() == Code::Unsupported);
+        for (const char * engine : {"auto", "llama.cpp"}) {
+            VlmOptions qo;
+            qo.text_engine = engine;
+            auto pipe = VlmPipeline::create(quant, qo);
+            EXPECT(pipe.is_ok());
+            if (!pipe.is_ok()) continue;
+            EXPECT_EQ(std::string(pipe.value().text_engine_used()), std::string(std::string(engine) == "auto" ? "metal" : "llama.cpp"));
+            auto out = pipe.value().generate(img, prompt, 32);
+            EXPECT(out.is_ok());
+            if (!out.is_ok()) { std::printf("        Q4_K_M %s: %s\n", engine, out.status().to_string().c_str()); continue; }
+            size_t agree = 0;
+            while (agree < out.value().tokens.size() && agree < generated.data.size() && out.value().tokens[agree] == static_cast<int32_t>(generated.data[agree])) agree++;
+            std::printf("        Q4_K_M %s (%s): %zu of %zu tokens equal transformers\n", engine, pipe.value().text_engine_used(), agree, generated.data.size());
+            EXPECT(agree >= 3);
+        }
     }
 }
 

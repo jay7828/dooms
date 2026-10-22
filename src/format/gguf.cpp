@@ -19,7 +19,8 @@ constexpr const char * kAlignmentKey = "general.alignment";
 constexpr int32_t kMaxValueTypeId = static_cast<int32_t>(GgufValueType::F64);
 
 // ggml_type ids this reader can map to a DType (see ggml.h enum ggml_type).
-constexpr int32_t kGgmlTypeF32 = 0, kGgmlTypeF16 = 1, kGgmlTypeI32 = 26, kGgmlTypeBF16 = 30;
+constexpr int32_t kGgmlTypeF32 = 0, kGgmlTypeF16 = 1, kGgmlTypeQ4_0 = 2, kGgmlTypeQ5_0 = 6, kGgmlTypeQ8_0 = 8, kGgmlTypeQ4_K = 12, kGgmlTypeQ6_K = 14,
+                  kGgmlTypeI32 = 26, kGgmlTypeBF16 = 30;
 
 // Bounds-checked little-endian reader over a byte range.
 class Cursor {
@@ -130,6 +131,11 @@ Result<DType> to_dtype(int32_t ggml_type, const std::string & tensor) {
         case kGgmlTypeF16:  return DType::F16;
         case kGgmlTypeBF16: return DType::BF16;
         case kGgmlTypeI32:  return DType::I32;
+        case kGgmlTypeQ4_0: return DType::Q4_0;
+        case kGgmlTypeQ5_0: return DType::Q5_0;
+        case kGgmlTypeQ8_0: return DType::Q8_0;
+        case kGgmlTypeQ4_K: return DType::Q4_K;
+        case kGgmlTypeQ6_K: return DType::Q6_K;
     }
     return unsupported("tensor '" + tensor + "' has ggml type " + std::to_string(ggml_type) +
                        ", which this reader does not support (supported: f32, f16, bf16, i32)");
@@ -250,11 +256,17 @@ Result<GgufFile> GgufFile::parse(const uint8_t * data, size_t size, const GgufLi
         if (!dtype.is_ok()) return dtype.status();
         info.dtype = dtype.value();
 
-        const uint64_t elem = dtype_size(info.dtype);
-        if (static_cast<uint64_t>(info.shape.numel()) > std::numeric_limits<uint64_t>::max() / elem) {
+        // Block types: each row (the innermost dimension) is a whole number of blocks.
+        const int64_t block = dtype_block_elems(info.dtype);
+        const int64_t row = info.shape.rank() > 0 ? info.shape.dim(info.shape.rank() - 1) : 1;
+        if (row % block != 0) {
+            return data_loss("tensor '" + info.name + "' has rows of " + std::to_string(row) + " elements, not a multiple of the " + dtype_name(info.dtype) + " block of " + std::to_string(block));
+        }
+        const uint64_t blocks = static_cast<uint64_t>(info.shape.numel() / block), bb = static_cast<uint64_t>(dtype_block_bytes(info.dtype));
+        if (blocks > std::numeric_limits<uint64_t>::max() / bb) {
             return data_loss("tensor '" + info.name + "' byte size overflows");
         }
-        info.nbytes = static_cast<uint64_t>(info.shape.numel()) * elem;
+        info.nbytes = blocks * bb;
         DOOMS_RETURN_IF_ERROR(c.read(&info.offset, "tensor data offset"));  // relative to the data section for now
 
         f.tensor_index_.emplace(info.name, f.tensors_.size());

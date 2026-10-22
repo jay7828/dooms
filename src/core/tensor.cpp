@@ -24,6 +24,7 @@ Result<std::array<int64_t, kMaxDims>> contiguous_strides(const Shape & shape, DT
 }  // namespace
 
 Result<TensorView> TensorView::create(void * data, const Shape & shape, DType dtype) {
+    if (dtype_is_quantized(dtype)) return unsupported(std::string("tensor views take plain element types, not ") + dtype_name(dtype));
     auto st = contiguous_strides(shape, dtype);
     if (!st.is_ok()) return st.status();
     return create_strided(data, shape, dtype, st.value().data(), shape.rank());
@@ -32,6 +33,7 @@ Result<TensorView> TensorView::create(void * data, const Shape & shape, DType dt
 Result<TensorView> TensorView::create_strided(void * data, const Shape & shape, DType dtype,
                                               const int64_t * strides_bytes, int n_strides) {
     if (data == nullptr) return invalid_argument("tensor data pointer is null");
+    if (dtype_is_quantized(dtype)) return unsupported(std::string("tensor views take plain element types, not ") + dtype_name(dtype));
     if (n_strides != shape.rank()) {
         return invalid_argument("got " + std::to_string(n_strides) + " strides for rank " +
                                 std::to_string(shape.rank()));

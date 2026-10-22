@@ -390,11 +390,29 @@ TEST(rejects_bad_tensor_shapes) {
 
 TEST(rejects_unsupported_tensor_types) {
     const Bytes data = raw_bytes(std::vector<float>(32, 0.f));
-    for (int32_t type : {kTypeQ4_0, 7, 40, -1, 9999}) {
+    for (int32_t type : {3 /* q4_1 */, 7, 40, -1, 9999}) {
         auto r = parse(with_tensor({"t", {32}, type, data, std::nullopt}));
         EXPECT(!r.is_ok());
         if (!r.is_ok()) EXPECT(r.status().code() == Code::Unsupported);
     }
+}
+
+// The block types the Metal text decoder reads: sized by whole blocks per row; a row that is not a whole number of blocks is DataLoss.
+TEST(quantized_tensors_are_sized_by_blocks) {
+    const Bytes data(4096, 0);
+    struct Case { int32_t type; int64_t row; uint64_t bytes; DType dtype; };
+    for (const Case & k : {Case{kTypeQ4_0, 64, 36, DType::Q4_0}, Case{6, 32, 22, DType::Q5_0}, Case{8, 96, 102, DType::Q8_0}, Case{12, 256, 144, DType::Q4_K},
+                           Case{14, 512, 420, DType::Q6_K}}) {
+        auto r = parse(with_tensor({"t", {k.row, 2}, k.type, Bytes(data.begin(), data.begin() + static_cast<long>(2 * k.bytes)), std::nullopt}));
+        EXPECT(r.is_ok());
+        if (!r.is_ok()) { std::printf("        %s\n", r.status().to_string().c_str()); continue; }
+        const GgufTensorInfo & t = r.value().tensors()[0];
+        EXPECT(t.dtype == k.dtype && t.nbytes == 2 * k.bytes);
+        EXPECT(dtype_is_quantized(t.dtype) && dtype_bytes(t.dtype, k.row).value() == k.bytes && !dtype_bytes(t.dtype, k.row + 1).is_ok());
+    }
+    EXPECT(code_of(with_tensor({"t", {33}, kTypeQ4_0, data, std::nullopt})) == Code::DataLoss);    // 33 is not a whole number of 32-element blocks
+    EXPECT(code_of(with_tensor({"t", {128}, 12, data, std::nullopt})) == Code::DataLoss);         // q4_K blocks hold 256
+    EXPECT(!dtype_is_quantized(DType::F16) && dtype_block_elems(DType::F32) == 1 && dtype_bytes(DType::F16, 3).value() == 6);
 }
 
 TEST(rejects_bad_tensor_offsets) {

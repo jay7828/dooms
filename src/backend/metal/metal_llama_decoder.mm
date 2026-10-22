@@ -23,6 +23,14 @@ constexpr uint32_t kDecodeRowsPerSimdgroup = 2;        // matvec1: rows per simd
 constexpr uint32_t kGateRowsPerSimdgroup = 1;          // gate_up1: outputs per simdgroup
 constexpr uint32_t kDecodeRowsPerGroup = kDecodeRowsPerSimdgroup * kSimdgroupsPerGroup;
 constexpr uint32_t kGateRowsPerGroup = kGateRowsPerSimdgroup * kSimdgroupsPerGroup;
+// The quantized matvec1 / gate_up1 (llama_kernels.h kQuantRows / kQuantGateRows): rows (gate/up pairs) per threadgroup, the row's work split over its
+// simdgroups. Measured: src/backend/metal/CLAUDE.md "Quantized matrices".
+constexpr uint32_t kQuantRows = 2, kQuantGateRows = 2;
+// A decode step attends over the cache split into chunks of positions (attention_split + attention_combine, flash-decoding) from kSplitMinPositions on, so
+// that n_head x splits threadgroups fill the GPU (one threadgroup per head starves it on long contexts); chunks of at least kSplitMinChunk positions.
+constexpr uint32_t kSplitMinPositions = 512, kSplitMinChunk = 64, kSplitTargetGroups = 128;
+// Simdgroups sharing one row (flags bits 8..10): enough 8-element groups per lane (a row of K has K/8): 4 for K >= 4096, 2 for K >= 2048, else 1.
+uint32_t quant_split(uint32_t K) { return K >= 4096 ? 4u : K >= 2048 ? 2u : 1u; }
 // Prefill matmuls: 16x16 tiles (matmul_16x16, many threadgroups for short chunks) or 64 rows x 32 tokens (matmul_big, llama.cpp's structure) from
 // kBigMinTokens tokens on, when every reduction length is a multiple of kBigK. Crossover measured: src/backend/metal/CLAUDE.md "Llama decoder".
 constexpr uint32_t kSmallTile = 16;
@@ -47,8 +55,19 @@ struct GemmParams { uint32_t K, N, M, x_stride, y_stride, flags; float eps; };
 struct AttnParams { uint32_t n_head, n_head_kv, head_dim, qkv_stride, kv_stride, out_stride, p0, fused_rope, neox; float scale, base; };
 struct EmbedParams { uint32_t n_embd, token_index, pos, use_pos; };
 struct ArgmaxParams { uint32_t n, out_index, use_mask; };
-static_assert(sizeof(MatvecParams) == 16 && sizeof(GemmParams) == 28 && sizeof(AttnParams) == 44 && sizeof(EmbedParams) == 16 && sizeof(ArgmaxParams) == 12,
-              "parameter structs must match the kernel source field for field");
+struct DequantParams { uint32_t K, rows; };
+struct SplitParams { uint32_t n_head, head_dim, q_stride, kv_stride, n_keys, chunk, n_split, out_stride; float scale; uint32_t group; };
+static_assert(sizeof(MatvecParams) == 16 && sizeof(GemmParams) == 28 && sizeof(AttnParams) == 44 && sizeof(EmbedParams) == 16 && sizeof(ArgmaxParams) == 12 &&
+              sizeof(DequantParams) == 8 && sizeof(SplitParams) == 40, "parameter structs must match the kernel source field for field");
+
+// Weight matrix types the decoder runs, in the order of the per-type kernel tables; the kernel names' suffixes (llama_kernels.h DOOMS_QUANT_KERNELS).
+constexpr DType kMatTypes[] = {DType::F16, DType::Q4_0, DType::Q5_0, DType::Q8_0, DType::Q4_K, DType::Q6_K};
+constexpr const char * kMatSuffix[] = {"", "Q4_0", "Q5_0", "Q8_0", "Q4_K", "Q6_K"};
+constexpr int kNumMatTypes = 6;
+int mat_type_index(DType t) {
+    for (int i = 0; i < kNumMatTypes; i++) if (kMatTypes[i] == t) return i;
+    return -1;
+}
 
 std::string describe(NSError * e) { return e ? std::string([[e localizedDescription] UTF8String]) : std::string("unknown error"); }
 
@@ -56,7 +75,11 @@ size_t align_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
 }  // namespace
 
-struct LayerOffsets { size_t attn_norm, qkv, qkv_bias, attn_output, ffn_norm, ffn_gate, ffn_up, ffn_down; bool has_bias; };
+// A matrix in the weight buffer: offset and element type (f16 or a ggml block type).
+struct MatRef { size_t off = 0; DType dt = DType::F16; };
+// q, k and v are one concatenated matrix when they share a type; otherwise one part each (Q4_K_M files mix q5_0 and q8_0 there), rows row0.. of the output.
+struct QkvPart { MatRef w; uint32_t row0 = 0, rows = 0; };
+struct LayerOffsets { size_t attn_norm = 0, qkv_bias = 0, ffn_norm = 0; MatRef attn_output, ffn_gate, ffn_up, ffn_down; std::vector<QkvPart> qkv; bool has_bias = false; };
 
 struct MetalLlamaDecoder::Impl {
     LlamaDecoderConfig cfg;
@@ -64,13 +87,23 @@ struct MetalLlamaDecoder::Impl {
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> p_matvec1, p_gate_up1, p_rope, p_attention, p_embed, p_argmax;
     id<MTLComputePipelineState> p_matmul, p_matmul_gate_up, p_matmul_big, p_gate_up_big, p_rms_scale;
+    id<MTLComputePipelineState> p_attn_split, p_attn_combine;   // long decode steps (head_dim 64 or 128), else nil
+    id<MTLBuffer> split_part;   // their per-split partial results
     id<MTLComputePipelineState> p_attn_prefill;   // flash attention for chunks of several tokens (head_dim 64 or 128), else nil
     bool big = false;        // the current encode_forward call uses the 64x32 kernels
     bool big_capable = false;  // every reduction length (n_embd, n_head*head_dim, n_ff) is a multiple of kBigK
     id<MTLComputePipelineState> p_matvec1_direct, p_gate_up1_direct;  // kStageInput = false variants (long input rows)
+    // Per matrix type (kMatTypes; index 0, f16, aliases the pipelines above): one-token kernels (staged / direct input), embedding lookup, dequantization
+    // to half for the prefill matmuls. Built for the types the model uses.
+    id<MTLComputePipelineState> __strong mv[kNumMatTypes], mv_direct[kNumMatTypes], gu[kNumMatTypes], gu_direct[kNumMatTypes], emb[kNumMatTypes], deq[kNumMatTypes];
+    id<MTLComputePipelineState> p_norm_vec;   // the quantized one-token kernels' input normalization (nil for an f16 model)
+    id<MTLBuffer> xn;        // that normalized input row
+    id<MTLBuffer> scratch;   // half copies of the quantized matrices a prefill matmul reads (gate and up side by side); nil for an f16 model
+    size_t scratch_half_off = 0;   // byte offset of the second matrix (up) in scratch
+    DType embd_type = DType::F16, output_type = DType::F16;
     uint32_t argmax_threads = 0;
     id<MTLBuffer> weights, kc, vc, x, qkv, attn, h, logits_buf, tokens, in_tokens, scale;  // scale: per-token RMS scales of a prefill chunk
-    size_t token_embd = 0, output_norm = 0, output = 0;
+    size_t token_embd = 0, output_norm = 0, output = 0;   // byte offsets in weights
     std::vector<LayerOffsets> layers;
     uint32_t qkv_width = 0, kv_width = 0, q_width = 0;
     size_t cache_layer_bytes = 0;
@@ -107,22 +140,46 @@ struct MetalLlamaDecoder::Impl {
         return Status();
     }
 
-    // One token: y (+)= W . x (x optionally RMS-normalized with gamma).
-    void matvec1(id<MTLComputeCommandEncoder> enc0, const char * kind, size_t w, id<MTLBuffer> xb, size_t x_off, id<MTLBuffer> yb, size_t gamma, uint32_t K, uint32_t N,
-                 uint32_t flags, size_t bias = 0) {
+    // xn = RMS-normalized x row (at x_off) * gamma: the input of the quantized one-token kernels, which take it normalized.
+    void norm_vec(id<MTLComputeCommandEncoder> enc0, id<MTLBuffer> xb, size_t x_off, size_t gamma, uint32_t K) {
         id<MTLComputeCommandEncoder> enc = enc_now(enc0);
-        MatvecParams p{K, N, flags, cfg.rms_eps};
-        const bool stage = K <= kMaxStagedInput;
-        [enc setComputePipelineState:stage ? p_matvec1 : p_matvec1_direct];
-        [enc setBuffer:weights offset:w atIndex:0];
+        MatvecParams p{K, 0, 0, cfg.rms_eps};
+        [enc setComputePipelineState:p_norm_vec];
+        [enc setBuffer:xb offset:x_off atIndex:0];
+        [enc setBuffer:xn offset:0 atIndex:1];
+        [enc setBuffer:weights offset:gamma atIndex:2];
+        [enc setBytes:&p length:sizeof p atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(kGroupThreads, 1, 1)];
+        after_dispatch("norm");
+    }
+
+    // One token: y (+)= W . x (x optionally RMS-normalized with gamma). A quantized W takes its input normalized: norm_vec first into xn (or, with
+    // input_normed, xn holds it already from the previous call).
+    void matvec1(id<MTLComputeCommandEncoder> enc0, const char * kind, MatRef w, id<MTLBuffer> xb, size_t x_off, id<MTLBuffer> yb, size_t gamma, uint32_t K, uint32_t N,
+                 uint32_t flags, size_t bias = 0, size_t y_off = 0, bool input_normed = false) {
+        const bool quant = w.dt != DType::F16;
+        if (quant && (flags & kFlagNorm)) {
+            if (!input_normed) norm_vec(enc0, xb, x_off, gamma, K);
+            xb = xn;
+            x_off = 0;
+            flags &= ~kFlagNorm;
+        }
+        id<MTLComputeCommandEncoder> enc = enc_now(enc0);
+        const uint32_t split = quant ? quant_split(K) : 1u;
+        MatvecParams p{K, N, flags | (quant ? split << 8 : 0u), cfg.rms_eps};
+        const bool stage = !quant && K <= kMaxStagedInput;
+        const int t = mat_type_index(w.dt);
+        [enc setComputePipelineState:stage ? mv[t] : mv_direct[t]];
+        [enc setBuffer:weights offset:w.off atIndex:0];
         [enc setBuffer:xb offset:x_off atIndex:1];
-        [enc setBuffer:yb offset:0 atIndex:2];
+        [enc setBuffer:yb offset:y_off atIndex:2];
         [enc setBuffer:weights offset:gamma atIndex:3];
         [enc setBytes:&p length:sizeof p atIndex:4];
         [enc setBuffer:weights offset:bias atIndex:5];
         [enc setBuffer:weights offset:0 atIndex:6];   // LayerNorm beta: unused (no LayerNorm flag) but bound
         [enc setThreadgroupMemoryLength:align_up(static_cast<size_t>(stage ? K : 4) * sizeof(float), 16) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((N + kDecodeRowsPerGroup - 1) / kDecodeRowsPerGroup, 1, 1) threadsPerThreadgroup:MTLSizeMake(kGroupThreads, 1, 1)];
+        const uint32_t per_group = quant ? kQuantRows * (kSimdgroupsPerGroup / split) : kDecodeRowsPerGroup;
+        [enc dispatchThreadgroups:MTLSizeMake((N + per_group - 1) / per_group, 1, 1) threadsPerThreadgroup:MTLSizeMake(kGroupThreads, 1, 1)];
         after_dispatch(kind);
     }
 
@@ -139,14 +196,29 @@ struct MetalLlamaDecoder::Impl {
     }
 
     // Several tokens: Y[M][N] (+)= X . W^T (X optionally RMS-normalized with gamma).
-    void matmul(id<MTLComputeCommandEncoder> enc0, const char * kind, size_t w, id<MTLBuffer> xb, id<MTLBuffer> yb, size_t gamma,
-                uint32_t K, uint32_t N, uint32_t M, uint32_t x_stride, uint32_t y_stride, uint32_t flags, size_t bias = 0) {
+    // A quantized matrix as half rows [rows][K] at scratch + off (the prefill matmuls read half weights).
+    void dequant(id<MTLComputeCommandEncoder> enc0, MatRef w, uint32_t K, uint32_t rows, size_t off) {
+        id<MTLComputeCommandEncoder> enc = enc_now(enc0);
+        DequantParams dp{K, rows};
+        [enc setComputePipelineState:deq[mat_type_index(w.dt)]];
+        [enc setBuffer:weights offset:w.off atIndex:0];
+        [enc setBuffer:scratch offset:off atIndex:1];
+        [enc setBytes:&dp length:sizeof dp atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(K, rows, 1) threadsPerThreadgroup:MTLSizeMake(std::min<uint32_t>(K, kGroupThreads), 1, 1)];
+        after_dispatch("dequant");
+    }
+
+    void matmul(id<MTLComputeCommandEncoder> enc0, const char * kind, MatRef w, id<MTLBuffer> xb, id<MTLBuffer> yb, size_t gamma,
+                uint32_t K, uint32_t N, uint32_t M, uint32_t x_stride, uint32_t y_stride, uint32_t flags, size_t bias = 0, size_t y_off = 0) {
+        id<MTLBuffer> wb = weights;
+        size_t w_off = w.off;
+        if (w.dt != DType::F16) { dequant(enc0, w, K, N, 0); wb = scratch; w_off = 0; }
         id<MTLComputeCommandEncoder> enc = enc_now(enc0);
         GemmParams p{K, N, M, x_stride, y_stride, flags, cfg.rms_eps};
         [enc setComputePipelineState:big ? p_matmul_big : p_matmul];
-        [enc setBuffer:weights offset:w atIndex:0];
+        [enc setBuffer:wb offset:w_off atIndex:0];
         [enc setBuffer:xb offset:0 atIndex:1];
-        [enc setBuffer:yb offset:0 atIndex:2];
+        [enc setBuffer:yb offset:y_off atIndex:2];
         [enc setBuffer:weights offset:gamma atIndex:3];
         [enc setBytes:&p length:sizeof p atIndex:4];
         [enc setBuffer:weights offset:bias atIndex:5];
@@ -160,6 +232,40 @@ struct MetalLlamaDecoder::Impl {
 
     void attention(id<MTLComputeCommandEncoder> enc0, size_t cache_off, uint32_t M, uint32_t p0, bool fused_rope) {
         const uint32_t nh = static_cast<uint32_t>(cfg.n_head), nkv = static_cast<uint32_t>(cfg.n_head_kv), hd = static_cast<uint32_t>(cfg.head_dim);
+        // A long decode step: rotate and cache (rope_store), then the split attention over all p0 + 1 positions.
+        const uint32_t n = p0 + 1;
+        if (fused_rope && p_attn_split && n >= kSplitMinPositions) {
+            AttnParams rp{nh, nkv, hd, qkv_width, kv_width, q_width, p0, 0u, cfg.rope_neox ? 1u : 0u, 1.f / std::sqrt(static_cast<float>(hd)), cfg.rope_base};
+            id<MTLComputeCommandEncoder> enc = enc_now(enc0);
+            [enc setComputePipelineState:p_rope];
+            [enc setBuffer:qkv offset:0 atIndex:0];
+            [enc setBuffer:kc offset:cache_off atIndex:1];
+            [enc setBuffer:vc offset:cache_off atIndex:2];
+            [enc setBytes:&rp length:sizeof rp atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(nh + 2 * nkv, 1, 1) threadsPerThreadgroup:MTLSizeMake(hd / 2, 1, 1)];
+            after_dispatch("rope_store");
+            const uint32_t want = std::max<uint32_t>(1, (kSplitTargetGroups + nh - 1) / nh);
+            const uint32_t chunk = std::max(kSplitMinChunk, (n + want - 1) / want), splits = (n + chunk - 1) / chunk;
+            SplitParams sp{nh, hd, qkv_width, kv_width, n, chunk, splits, q_width, 1.f / std::sqrt(static_cast<float>(hd)), nh / nkv};
+            enc = enc_now(enc0);
+            [enc setComputePipelineState:p_attn_split];
+            [enc setBuffer:qkv offset:0 atIndex:0];
+            [enc setBuffer:kc offset:cache_off atIndex:1];
+            [enc setBuffer:vc offset:cache_off atIndex:2];
+            [enc setBuffer:split_part offset:0 atIndex:3];
+            [enc setBytes:&sp length:sizeof sp atIndex:4];
+            [enc setThreadgroupMemoryLength:align_up(static_cast<size_t>(chunk) * sizeof(float), 16) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(nh, splits, 1) threadsPerThreadgroup:MTLSizeMake(kAttnThreads, 1, 1)];
+            after_dispatch("attention");
+            enc = enc_now(enc0);
+            [enc setComputePipelineState:p_attn_combine];
+            [enc setBuffer:split_part offset:0 atIndex:0];
+            [enc setBuffer:attn offset:0 atIndex:1];
+            [enc setBytes:&sp length:sizeof sp atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(nh, 1, 1) threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
+            after_dispatch("attention_combine");
+            return;
+        }
         AttnParams ap{nh, nkv, hd, qkv_width, kv_width, q_width, p0, fused_rope ? 1u : 0u, cfg.rope_neox ? 1u : 0u, 1.f / std::sqrt(static_cast<float>(hd)), cfg.rope_base};
         id<MTLComputeCommandEncoder> enc = enc_now(enc0);
         if (!fused_rope) {
@@ -204,34 +310,49 @@ struct MetalLlamaDecoder::Impl {
             const LayerOffsets & L = layers[l];
             const size_t cache_off = l * cache_layer_bytes;
             if (M == 1) {
-                matvec1(enc0, "qkv", L.qkv, x, 0, qkv, L.attn_norm, E, qkv_width, kFlagNorm | (L.has_bias ? kFlagBias : 0u), L.qkv_bias);
+                bool normed = false;   // xn holds the normalized input once a quantized part ran
+                for (const QkvPart & q : L.qkv) {
+                    matvec1(enc0, "qkv", q.w, x, 0, qkv, L.attn_norm, E, q.rows, kFlagNorm | (L.has_bias ? kFlagBias : 0u), L.qkv_bias + q.row0 * sizeof(float),
+                            q.row0 * sizeof(float), normed);
+                    normed = normed || q.w.dt != DType::F16;
+                }
                 attention(enc0, cache_off, 1, p0, true);
                 matvec1(enc0, "attn_output", L.attn_output, attn, 0, x, 0, q_width, E, kFlagAccumulate);
+                const bool quant = L.ffn_gate.dt != DType::F16;
+                if (quant) norm_vec(enc0, x, 0, L.ffn_norm, E);
                 id<MTLComputeCommandEncoder> enc = enc_now(enc0);
-                MatvecParams gp{E, F, kFlagNorm, cfg.rms_eps};
-                const bool stage = E <= kMaxStagedInput;
-                [enc setComputePipelineState:stage ? p_gate_up1 : p_gate_up1_direct];
-                [enc setBuffer:weights offset:L.ffn_gate atIndex:0];
-                [enc setBuffer:weights offset:L.ffn_up atIndex:1];
-                [enc setBuffer:x offset:0 atIndex:2];
+                const uint32_t gsplit = quant ? quant_split(E) : 1u;
+                MatvecParams gp{E, F, quant ? gsplit << 8 : kFlagNorm, cfg.rms_eps};
+                const bool stage = !quant && E <= kMaxStagedInput;
+                const int t = mat_type_index(L.ffn_gate.dt);
+                [enc setComputePipelineState:stage ? gu[t] : gu_direct[t]];
+                [enc setBuffer:weights offset:L.ffn_gate.off atIndex:0];
+                [enc setBuffer:weights offset:L.ffn_up.off atIndex:1];
+                [enc setBuffer:quant ? xn : x offset:0 atIndex:2];
                 [enc setBuffer:h offset:0 atIndex:3];
                 [enc setBuffer:weights offset:L.ffn_norm atIndex:4];
                 [enc setBytes:&gp length:sizeof gp atIndex:5];
                 [enc setThreadgroupMemoryLength:align_up(static_cast<size_t>(stage ? E : 4) * sizeof(float), 16) atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake((F + kGateRowsPerGroup - 1) / kGateRowsPerGroup, 1, 1) threadsPerThreadgroup:MTLSizeMake(kGroupThreads, 1, 1)];
+                const uint32_t gate_per_group = quant ? kQuantGateRows * (kSimdgroupsPerGroup / gsplit) : kGateRowsPerGroup;
+                [enc dispatchThreadgroups:MTLSizeMake((F + gate_per_group - 1) / gate_per_group, 1, 1) threadsPerThreadgroup:MTLSizeMake(kGroupThreads, 1, 1)];
                 after_dispatch("gate_up");
                 matvec1(enc0, "ffn_down", L.ffn_down, h, 0, x, 0, F, E, kFlagAccumulate);
             } else {
                 if (big) rms_scale(enc0, M);
-                matmul(enc0, "qkv", L.qkv, x, qkv, L.attn_norm, E, qkv_width, M, E, qkv_width, kFlagNorm | (L.has_bias ? kFlagBias : 0u), L.qkv_bias);
+                for (const QkvPart & q : L.qkv) {
+                    matmul(enc0, "qkv", q.w, x, qkv, L.attn_norm, E, q.rows, M, E, qkv_width, kFlagNorm | (L.has_bias ? kFlagBias : 0u), L.qkv_bias + q.row0 * sizeof(float),
+                           q.row0 * sizeof(float));
+                }
                 attention(enc0, cache_off, M, p0, false);
                 matmul(enc0, "attn_output", L.attn_output, attn, x, 0, q_width, E, M, q_width, E, kFlagAccumulate);
                 if (big) rms_scale(enc0, M);
+                const bool quant = L.ffn_gate.dt != DType::F16;
+                if (quant) { dequant(enc0, L.ffn_gate, E, F, 0); dequant(enc0, L.ffn_up, E, F, scratch_half_off); }
                 id<MTLComputeCommandEncoder> enc = enc_now(enc0);
                 GemmParams gp{E, F, M, E, F, kFlagNorm, cfg.rms_eps};
                 [enc setComputePipelineState:big ? p_gate_up_big : p_matmul_gate_up];
-                [enc setBuffer:weights offset:L.ffn_gate atIndex:0];
-                [enc setBuffer:weights offset:L.ffn_up atIndex:1];
+                [enc setBuffer:quant ? scratch : weights offset:quant ? 0 : L.ffn_gate.off atIndex:0];
+                [enc setBuffer:quant ? scratch : weights offset:quant ? scratch_half_off : L.ffn_up.off atIndex:1];
                 [enc setBuffer:x offset:0 atIndex:2];
                 [enc setBuffer:h offset:0 atIndex:3];
                 [enc setBuffer:weights offset:L.ffn_norm atIndex:4];
@@ -245,7 +366,7 @@ struct MetalLlamaDecoder::Impl {
             }
         }
         const uint32_t V = static_cast<uint32_t>(cfg.n_vocab);
-        matvec1(enc0, "output", output, x, static_cast<size_t>(M - 1) * E * sizeof(float), logits_buf, output_norm, E, V, kFlagNorm);
+        matvec1(enc0, "output", MatRef{output, output_type}, x, static_cast<size_t>(M - 1) * E * sizeof(float), logits_buf, output_norm, E, V, kFlagNorm);
         id<MTLComputeCommandEncoder> enc = enc_now(enc0);
         ArgmaxParams ap{V, out_index, 0};
         [enc setComputePipelineState:p_argmax];
@@ -260,7 +381,7 @@ struct MetalLlamaDecoder::Impl {
     void encode_embed(id<MTLComputeCommandEncoder> enc0, id<MTLBuffer> ids, uint32_t first, uint32_t rows) {
         id<MTLComputeCommandEncoder> enc = enc_now(enc0);
         EmbedParams ep{static_cast<uint32_t>(cfg.n_embd), first, 0, 0};
-        [enc setComputePipelineState:p_embed];
+        [enc setComputePipelineState:emb[mat_type_index(embd_type)]];
         [enc setBuffer:weights offset:token_embd atIndex:0];
         [enc setBuffer:ids offset:0 atIndex:1];
         [enc setBuffer:x offset:0 atIndex:2];
@@ -322,7 +443,10 @@ Result<std::unique_ptr<MetalLlamaDecoder>> MetalLlamaDecoder::create(const Llama
         if (r.rows != rows || r.cols != cols) {
             return invalid_argument("weight '" + name + "' is " + std::to_string(r.rows) + "x" + std::to_string(r.cols) + ", expected " + std::to_string(rows) + "x" + std::to_string(cols));
         }
-        if (matrix && r.dtype != DType::F16) return unsupported("weight '" + name + "' is " + dtype_name(r.dtype) + "; the Metal decoder takes f16 matrices");
+        if (matrix && mat_type_index(r.dtype) < 0) {
+            return unsupported("weight '" + name + "' is " + dtype_name(r.dtype) + "; the Metal decoder takes f16, q4_0, q5_0, q8_0, q4_K and q6_K matrices");
+        }
+        if (matrix && r.cols % dtype_block_elems(r.dtype) != 0) return invalid_argument("weight '" + name + "' rows are not whole " + dtype_name(r.dtype) + " blocks");
         if (!matrix && r.dtype != DType::F32 && r.dtype != DType::F16) return unsupported("norm '" + name + "' is " + dtype_name(r.dtype) + "; expected f32 or f16");
         return Status();
     };
@@ -357,6 +481,9 @@ Result<std::unique_ptr<MetalLlamaDecoder>> MetalLlamaDecoder::create(const Llama
         if (st.is_ok()) st = check(L.ffn_gate, F, E, true, b + "ffn_gate");
         if (st.is_ok()) st = check(L.ffn_up, F, E, true, b + "ffn_up");
         if (st.is_ok()) st = check(L.ffn_down, E, F, true, b + "ffn_down");
+        if (st.is_ok() && L.ffn_gate.dtype != L.ffn_up.dtype) {
+            st = unsupported(b + "ffn_gate is " + dtype_name(L.ffn_gate.dtype) + " and ffn_up " + dtype_name(L.ffn_up.dtype) + "; the fused gate/up kernel takes one type");
+        }
     }
     if (!st.is_ok()) return st;
 
@@ -400,10 +527,37 @@ Result<std::unique_ptr<MetalLlamaDecoder>> MetalLlamaDecoder::create(const Llama
         if (c.head_dim == 64 || c.head_dim == 128) {
             if (Status s = pipeline_with(c.head_dim == 64 ? "attention_prefill_64" : "attention_prefill_128", true, m.p_attn_prefill); !s.is_ok()) return s;
             if (m.p_attn_prefill.maxTotalThreadsPerThreadgroup < kGroupThreads) m.p_attn_prefill = nil;   // fall back to the per-query kernel
+            if (Status s = pipeline_with("attention_split", true, m.p_attn_split); !s.is_ok()) return s;
+            if (Status s = pipeline_with("attention_combine", true, m.p_attn_combine); !s.is_ok()) return s;
+            if (m.p_attn_split.maxTotalThreadsPerThreadgroup < kAttnThreads) { m.p_attn_split = nil; m.p_attn_combine = nil; }
         }
         m.big_capable = c.n_embd % kBigK == 0 && c.n_ff % kBigK == 0 && (c.n_head * c.head_dim) % kBigK == 0;
         if (Status s = pipeline_with("matvec1", false, m.p_matvec1_direct); !s.is_ok()) return s;
         if (Status s = pipeline_with("gate_up1", false, m.p_gate_up1_direct); !s.is_ok()) return s;
+        m.mv[0] = m.p_matvec1; m.mv_direct[0] = m.p_matvec1_direct; m.gu[0] = m.p_gate_up1; m.gu_direct[0] = m.p_gate_up1_direct; m.emb[0] = m.p_embed;
+        // The quantized types this model uses.
+        bool used[kNumMatTypes] = {};
+        auto use = [&](const WeightRef & r) { if (r.data) used[mat_type_index(r.dtype)] = true; };
+        use(w.token_embd); use(w.output);
+        for (const LlamaLayerWeights & L : w.layers) {
+            for (const WeightRef * r : {&L.attn_q, &L.attn_k, &L.attn_v, &L.attn_qkv, &L.attn_output, &L.ffn_gate, &L.ffn_up, &L.ffn_down}) use(*r);
+        }
+        bool any_used = false;
+        for (int t = 1; t < kNumMatTypes; t++) any_used = any_used || used[t];
+        if (any_used) {
+            if (Status s = pipeline_with("norm_vec", true, m.p_norm_vec); !s.is_ok()) return s;
+            if (m.p_norm_vec.maxTotalThreadsPerThreadgroup < kGroupThreads) return unsupported("kernel norm_vec cannot run " + std::to_string(kGroupThreads) + " threads per group on this GPU");
+        }
+        for (int t = 1; t < kNumMatTypes; t++) {
+            if (!used[t]) continue;
+            const std::string sfx = std::string("_") + kMatSuffix[t];
+            for (auto & [name, stage, slot] : std::initializer_list<std::tuple<std::string, bool, id<MTLComputePipelineState> __strong *>>{
+                     {"matvec1" + sfx, true, &m.mv[t]}, {"matvec1" + sfx, false, &m.mv_direct[t]}, {"gate_up1" + sfx, true, &m.gu[t]},
+                     {"gate_up1" + sfx, false, &m.gu_direct[t]}, {"embed" + sfx, true, &m.emb[t]}, {"dequant" + sfx, true, &m.deq[t]}}) {
+                if (Status s = pipeline_with(name.c_str(), stage, *slot); !s.is_ok()) return s;
+                if ((*slot).maxTotalThreadsPerThreadgroup < kGroupThreads) return unsupported("kernel " + name + " cannot run " + std::to_string(kGroupThreads) + " threads per group on this GPU");
+            }
+        }
         if (m.p_attention.maxTotalThreadsPerThreadgroup < kAttnThreads) return unsupported("the attention kernel cannot run " + std::to_string(kAttnThreads) + " threads per group on this GPU");
         for (id<MTLComputePipelineState> pso : {m.p_matvec1, m.p_gate_up1, m.p_matvec1_direct, m.p_gate_up1_direct}) {
             if (pso.maxTotalThreadsPerThreadgroup < kGroupThreads) return unsupported("a decoder kernel cannot run " + std::to_string(kGroupThreads) + " threads per group on this GPU");
@@ -415,23 +569,38 @@ Result<std::unique_ptr<MetalLlamaDecoder>> MetalLlamaDecoder::create(const Llama
         size_t total = 0;
         auto reserve = [&](size_t bytes) { const size_t off = total; total = align_up(total + bytes, kWeightAlign); return off; };
         const size_t norm_bytes = static_cast<size_t>(E) * sizeof(float);
-        auto mat_bytes = [](const WeightRef & r) { return static_cast<size_t>(r.rows * r.cols) * 2; };
-        m.token_embd = reserve(mat_bytes(w.token_embd));
+        // Bytes of a matrix: whole blocks per row (checked above), for f16 two per element.
+        auto mat_bytes = [](const WeightRef & r) { return static_cast<size_t>(r.rows) * static_cast<size_t>(dtype_bytes(r.dtype, r.cols).value()); };
+        auto mat = [&](const WeightRef & r) { return MatRef{reserve(mat_bytes(r)), r.dtype}; };
+        const MatRef embd = mat(w.token_embd);
+        m.token_embd = embd.off;
+        m.embd_type = w.token_embd.dtype;
         const bool tied = w.output.data == w.token_embd.data;
-        m.output = tied ? m.token_embd : reserve(mat_bytes(w.output));
+        m.output = tied ? m.token_embd : mat(w.output).off;
+        m.output_type = w.output.dtype;
         m.output_norm = reserve(norm_bytes);
+        bool any_quant = false;
         for (const LlamaLayerWeights & L : w.layers) {
             LayerOffsets o;
             o.attn_norm = reserve(norm_bytes);
-            o.qkv = reserve(static_cast<size_t>(m.qkv_width) * static_cast<size_t>(E) * 2);
+            if (L.attn_qkv.data) o.qkv.push_back({mat(L.attn_qkv), 0, m.qkv_width});
+            else if (L.attn_q.dtype == L.attn_k.dtype && L.attn_k.dtype == L.attn_v.dtype) {   // one concatenated matrix (filled below in this order)
+                o.qkv.push_back({MatRef{reserve(mat_bytes(L.attn_q) + mat_bytes(L.attn_k) + mat_bytes(L.attn_v)), L.attn_q.dtype}, 0, m.qkv_width});
+            } else {
+                o.qkv.push_back({mat(L.attn_q), 0, m.q_width});
+                o.qkv.push_back({mat(L.attn_k), m.q_width, m.kv_width});
+                o.qkv.push_back({mat(L.attn_v), m.q_width + m.kv_width, m.kv_width});
+            }
             o.has_bias = L.attn_qkv_bias.data || L.attn_q_bias.data;
             o.qkv_bias = o.has_bias ? reserve(static_cast<size_t>(m.qkv_width) * sizeof(float)) : 0;
-            o.attn_output = reserve(mat_bytes(L.attn_output));
+            o.attn_output = mat(L.attn_output);
             o.ffn_norm = reserve(norm_bytes);
-            o.ffn_gate = reserve(mat_bytes(L.ffn_gate));
-            o.ffn_up = reserve(mat_bytes(L.ffn_up));
-            o.ffn_down = reserve(mat_bytes(L.ffn_down));
-            m.layers.push_back(o);
+            o.ffn_gate = mat(L.ffn_gate);
+            o.ffn_up = mat(L.ffn_up);
+            o.ffn_down = mat(L.ffn_down);
+            for (const QkvPart & q : o.qkv) any_quant |= q.w.dt != DType::F16;
+            for (DType t : {o.attn_output.dt, o.ffn_gate.dt, o.ffn_down.dt}) any_quant |= t != DType::F16;
+            m.layers.push_back(std::move(o));
         }
         m.weights = [m.device newBufferWithLength:total options:MTLResourceStorageModeShared];
         if (!m.weights) return resource_exhausted("could not allocate " + std::to_string(total) + " bytes for the decoder weights");
@@ -453,11 +622,15 @@ Result<std::unique_ptr<MetalLlamaDecoder>> MetalLlamaDecoder::create(const Llama
             const LlamaLayerWeights & L = w.layers[l];
             const LayerOffsets & o = m.layers[l];
             put_norm(o.attn_norm, L.attn_norm);
-            if (L.attn_qkv.data) put_mat(o.qkv, L.attn_qkv);
-            else {
-                put_mat(o.qkv, L.attn_q);
-                put_mat(o.qkv + mat_bytes(L.attn_q), L.attn_k);
-                put_mat(o.qkv + mat_bytes(L.attn_q) + mat_bytes(L.attn_k), L.attn_v);
+            if (L.attn_qkv.data) put_mat(o.qkv[0].w.off, L.attn_qkv);
+            else if (o.qkv.size() == 1) {
+                put_mat(o.qkv[0].w.off, L.attn_q);
+                put_mat(o.qkv[0].w.off + mat_bytes(L.attn_q), L.attn_k);
+                put_mat(o.qkv[0].w.off + mat_bytes(L.attn_q) + mat_bytes(L.attn_k), L.attn_v);
+            } else {
+                put_mat(o.qkv[0].w.off, L.attn_q);
+                put_mat(o.qkv[1].w.off, L.attn_k);
+                put_mat(o.qkv[2].w.off, L.attn_v);
             }
             if (L.attn_qkv_bias.data) put_vec(o.qkv_bias, L.attn_qkv_bias);
             else if (L.attn_q_bias.data) {
@@ -465,11 +638,11 @@ Result<std::unique_ptr<MetalLlamaDecoder>> MetalLlamaDecoder::create(const Llama
                 put_vec(o.qkv_bias + static_cast<size_t>(m.q_width) * sizeof(float), L.attn_k_bias);
                 put_vec(o.qkv_bias + static_cast<size_t>(m.q_width + m.kv_width) * sizeof(float), L.attn_v_bias);
             }
-            put_mat(o.attn_output, L.attn_output);
+            put_mat(o.attn_output.off, L.attn_output);
             put_norm(o.ffn_norm, L.ffn_norm);
-            put_mat(o.ffn_gate, L.ffn_gate);
-            put_mat(o.ffn_up, L.ffn_up);
-            put_mat(o.ffn_down, L.ffn_down);
+            put_mat(o.ffn_gate.off, L.ffn_gate);
+            put_mat(o.ffn_up.off, L.ffn_up);
+            put_mat(o.ffn_down.off, L.ffn_down);
         }
 
         // Activations for the largest chunk, the KV cache, the logits and the token ids.
@@ -490,8 +663,17 @@ Result<std::unique_ptr<MetalLlamaDecoder>> MetalLlamaDecoder::create(const Llama
                  {static_cast<size_t>(V) * 4, &m.logits_buf, "logits"},
                  {(static_cast<size_t>(c.n_ctx) + 1) * 4, &m.tokens, "token ids"},
                  {B * 4, &m.in_tokens, "input token ids"},
-                 {B * 4, &m.scale, "RMS scales"}}) {
+                 {B * 4, &m.scale, "RMS scales"},
+                 {static_cast<size_t>(c.n_head) * ((static_cast<size_t>(c.n_ctx) + kSplitMinChunk - 1) / kSplitMinChunk) * (4 + static_cast<size_t>(c.head_dim)) * 4,
+                  &m.split_part, "split attention partials"}}) {
             if (Status s = buffer(bytes, *slot, what); !s.is_ok()) return s;
+        }
+        if (any_quant) {   // the largest matrix a prefill matmul dequantizes, gate and up together
+            const size_t gate_bytes = static_cast<size_t>(F) * static_cast<size_t>(E) * 2;
+            m.scratch_half_off = align_up(gate_bytes, kWeightAlign);
+            const size_t need = std::max<size_t>({2 * m.scratch_half_off, static_cast<size_t>(m.qkv_width) * static_cast<size_t>(E) * 2, static_cast<size_t>(E) * m.q_width * 2});
+            if (Status s = buffer(need, m.scratch, "dequantization scratch"); !s.is_ok()) return s;
+            if (Status s = buffer(static_cast<size_t>(E) * sizeof(float), m.xn, "normalized input row"); !s.is_ok()) return s;
         }
     }
     return std::unique_ptr<MetalLlamaDecoder>(new MetalLlamaDecoder(std::move(impl)));

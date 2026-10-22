@@ -36,7 +36,7 @@ string. Each call is a fresh conversation. Errors raise `dooms.DoomsError` (`.co
 
 **Device.** `LLM`, `Whisper` and `TTS` take `device="auto"` (default: the GPU, and the CPU when no Metal device can run the model), `"gpu"` (an error instead of the
 fallback) or `"cpu"`; the environment variable `DOOMS_DEVICE` sets it for "auto" (also for the C API's `device` fields and the CLIs' `--device`). `stt.device` /
-`tts.device` say where the decoder / vocoder ended up. On the CPU the results stay correct (f32; the same text) but slower: whisper-tiny ~5x and Kokoro ~3x the
+`tts.device` say where the decoder / vocoder ended up. On the CPU the results stay correct (f32; the same text) but slower: whisper-tiny ~4.6x and Kokoro ~2.4x the
 GPU's time. Whisper on the CPU uses `encoder-fp32.mlpackage` next to the model when present; for large-v3-turbo write it with
 `tools/convert/convert_whisper.py --model <snapshot> --only-cpu-encoder` (2.4 GB; the prebuilt download does not include it), otherwise punctuation can differ.
 

@@ -71,6 +71,11 @@ ggml_type to_ggml_type(DType t) {
         case DType::F16:  return GGML_TYPE_F16;
         case DType::BF16: return GGML_TYPE_BF16;
         case DType::I32:  return GGML_TYPE_I32;
+        case DType::Q4_0: return GGML_TYPE_Q4_0;
+        case DType::Q5_0: return GGML_TYPE_Q5_0;
+        case DType::Q8_0: return GGML_TYPE_Q8_0;
+        case DType::Q4_K: return GGML_TYPE_Q4_K;
+        case DType::Q6_K: return GGML_TYPE_Q6_K;
     }
     DOOMS_CHECK(false, "unknown DType");
     return GGML_TYPE_F32;

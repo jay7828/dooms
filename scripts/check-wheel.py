@@ -52,8 +52,8 @@ def main(argv):
         for want in (f"Name: dooms-cpp\n", f"Version: {version}\n", "License: Apache-2.0\n", "Requires-Python: >=3.9\n", "Description-Content-Type: text/markdown\n"):
             if want not in meta:
                 bad.append(f"METADATA lacks {want.strip()!r}")
-        for lic in ("LICENSE", "NOTICE", "LICENSE-llama.cpp"):
-            if dist_info + lic not in names:
+        for lic in ("LICENSE", "NOTICE", "LICENSE-llama.cpp"):   # dist-info/ (older setuptools) or dist-info/licenses/ (PEP 639, setuptools >= 77)
+            if dist_info + lic not in names and dist_info + "licenses/" + lic not in names:
                 bad.append(f"licence file {lic} missing from {dist_info}")
         entry = z.read(dist_info + "entry_points.txt").decode() if dist_info + "entry_points.txt" in names else ""
         if "dooms = dooms.cli:main" not in entry:

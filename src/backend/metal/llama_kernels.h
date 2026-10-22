@@ -3,10 +3,13 @@
 // in metal_llama_decoder.mm field for field (all 32-bit); the host checks their sizes. Constants named k... below must equal the host's constants of the same
 // names. Measurements behind the shapes: src/backend/metal/CLAUDE.md "Llama decoder".
 
+#include <string>
+
 namespace dooms {
 
+// Two literals joined once (one literal may not exceed 65536 characters): the f16 kernels, then the quantized-format kernels.
 inline const char * llama_kernel_source() {
-    return R"MSL(
+    static const std::string source = std::string(R"MSL(
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
 using namespace metal;
@@ -795,9 +798,11 @@ struct SplitParams {
     uint n_split;
     uint out_stride;  // floats between output tokens
     float scale;
+    uint group;       // query heads per key/value head (grouped-query attention; 1: one key/value head per query head)
 };
 
-// Attention without a causal mask over many keys (Whisper's cross-attention: 1500 audio positions), split over the positions so that every core has work:
+// Attention without a causal mask over many keys (Whisper's cross-attention: 1500 audio positions; a long decode step's self-attention over the cache, whose
+// positions are all visible), split over the positions so that every core has work:
 // threadgroup (head, split, query token) scores its chunk, and writes (max, sum of exp, 2 unused, unnormalized value sum) to part (4 + head_dim floats per
 // entry); attention_combine merges the splits. The query is pre-scaled here. head_dim 64 or 128 (the host checks).
 kernel void attention_split(device const float * q [[buffer(0)]], device const half * kc [[buffer(1)]], device const half * vc [[buffer(2)]],
@@ -813,8 +818,9 @@ kernel void attention_split(device const float * q [[buffer(0)]], device const h
     for (uint i = tid; i < hd4; i += kAttnThreads) qs4[i] = qrow[i] * p.scale;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float mx = -INFINITY;
+    const uint kvh = h / p.group;
     for (uint j = tid; j < n; j += kAttnThreads) {
-        device const half4 * k = (device const half4 *)(kc + (ulong)(j0 + j) * p.kv_stride + h * hd);
+        device const half4 * k = (device const half4 *)(kc + (ulong)(j0 + j) * p.kv_stride + kvh * hd);
         float sc = 0.f;
         for (uint i = 0; i < hd4; i++) sc += dot(qs4[i], float4(k[i]));
         scores[j] = sc;
@@ -839,7 +845,7 @@ kernel void attention_split(device const float * q [[buffer(0)]], device const h
     for (uint i = 0; i < kAttnSimdgroups; i++) sum += red[i];
     const uint groups = kAttnThreads / hd4, pg = tid / hd4, d4 = tid % hd4;
     float4 acc = 0.f;
-    for (uint j = pg; j < n; j += groups) acc += scores[j] * float4(((device const half4 *)(vc + (ulong)(j0 + j) * p.kv_stride + h * hd))[d4]);
+    for (uint j = pg; j < n; j += groups) acc += scores[j] * float4(((device const half4 *)(vc + (ulong)(j0 + j) * p.kv_stride + kvh * hd))[d4]);
     partial4[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device float * out = part + ((ulong)(t * p.n_head + h) * p.n_split + s) * (4 + hd);   // (max, sum, -, -, values): 16-byte aligned
@@ -915,7 +921,306 @@ kernel void argmax(device const float * logits [[buffer(0)]], device int * token
         tokens[p.out_index] = k;
     }
 }
+)MSL") + R"MSL(
+// ---- Quantized weights: ggml's block formats, read in place (one token: dot products per 32-element chunk; prefill: dequantized to half first) ----
+// Layouts (ggml-common.h): q4_0 {half d; uchar qs[16]} 18 B / 32; q5_0 {half d; uchar qh[4]; uchar qs[16]} 22 B / 32; q8_0 {half d; char qs[32]} 34 B / 32;
+// q4_K {half d, dmin; uchar scales[12]; uchar qs[128]} 144 B / 256; q6_K {uchar ql[128]; uchar qh[64]; char scales[16]; half d} 210 B / 256.
+// Blocks are only 2-byte aligned (rows follow each other unpadded), so the reads are bytes and halves. The values equal ggml's dequantize_row_* exactly.
+
+static float ld_half(device const uchar * p) { return float(*(device const half *)p); }
+
+// The quantized one-token kernels split each row into groups of 8 elements, one group per lane per step (an 896-wide row is 3.5 steps, a 4864-wide one 19),
+// grouped by each format's byte layout so a lane's bytes are contiguous and every byte it loads is used whole. The input values of a group are loaded once
+// and shared by the rows a simdgroup computes, with the sums that fold the formats' offsets (q - 8, q - 16, the q4_K mins, q - 32) out of the per-element work.
+struct XGroup {
+    float4 a, b;   // the group's 8 input values in the format's order (below)
+    float4 s;      // their partial sums the format needs
+};
+
+// The input as the projection sees it: 4 or 2 consecutive values from element k.
+static float4 xin4(threadgroup const float4 * xs4, device const float * x, device const float * gamma, bool norm, uint k) {
+    return input4(xs4, x, gamma, norm, k / 4);
+}
+static float2 xin2(threadgroup const float4 * xs4, device const float * x, device const float * gamma, bool norm, uint k) {
+    if (kStageInput) { threadgroup const float * xs = (threadgroup const float *)xs4; return float2(xs[k], xs[k + 1]); }
+    const float2 v = float2(x[k], x[k + 1]);
+    return norm ? v * float2(gamma[k], gamma[k + 1]) : v;
+}
+
+static float hsum(float4 v) { return v.x + v.y + v.z + v.w; }
+// Four bytes of a word as floats (the unpacking is done on whole words: nibbles with 0x0F0F0F0F masks, then one conversion).
+static float4 bytes4(uint u) { return float4(as_type<uchar4>(u)); }
+
+// Bit i of a 4-bit value moved to bit 4 of byte i: q5_0's fifth bits for four elements at once.
+constant uint kQ5High[16] = {0x00000000u, 0x00000010u, 0x00001000u, 0x00001010u, 0x00100000u, 0x00100010u, 0x00101000u, 0x00101010u,
+                             0x10000000u, 0x10000010u, 0x10001000u, 0x10001010u, 0x10100000u, 0x10100010u, 0x10101000u, 0x10101010u};
+
+// Per format: elem (embedding lookup, dequantization for the prefill), load (group g's input values and sums) and dot (one row's group g).
+// q4_0 / q5_0: group g = block g/4, bytes 4q..4q+3 (q = g%4) of qs: low nibbles are elements 4q.. (a), high nibbles 16+4q.. (b).
+struct Q4_0 {
+    enum { BLK = 32, BYTES = 18 };
+    static float elem(device const uchar * row, uint i) {
+        device const uchar * b = row + (i / 32) * 18;
+        const uint j = i % 32, q = b[2 + (j & 15)];
+        return ld_half(b) * (float(j < 16 ? (q & 15u) : (q >> 4)) - 8.f);
+    }
+    static void load(threadgroup const float4 * xs4, device const float * x, device const float * gamma, bool norm, uint g, thread XGroup & xg) {
+        const uint k = (g / 4) * 32 + (g % 4) * 4;
+        xg.a = xin4(xs4, x, gamma, norm, k);
+        xg.b = xin4(xs4, x, gamma, norm, k + 16);
+        xg.s.x = hsum(xg.a) + hsum(xg.b);
+    }
+    static uint qword(device const uchar * p) { device const ushort * q = (device const ushort *)p; return uint(q[0]) | (uint(q[1]) << 16); }
+    static float dot(device const uchar * row, uint g, thread const XGroup & x) {
+        device const uchar * b = row + (g / 4) * 18;
+        const uint u = qword(b + 2 + (g % 4) * 4);
+        return ld_half(b) * (metal::dot(bytes4(u & 0x0F0F0F0Fu), x.a) + metal::dot(bytes4((u >> 4) & 0x0F0F0F0Fu), x.b) - 8.f * x.s.x);
+    }
+};
+
+struct Q5_0 {
+    enum { BLK = 32, BYTES = 22 };
+    static uint high_bits(device const uchar * b) { return Q4_0::qword(b + 2); }
+    static float elem(device const uchar * row, uint i) {
+        device const uchar * b = row + (i / 32) * 22;
+        const uint j = i % 32, q = b[6 + (j & 15)], low = j < 16 ? (q & 15u) : (q >> 4);
+        return ld_half(b) * (float(low | (((high_bits(b) >> j) & 1u) << 4)) - 16.f);
+    }
+    static void load(threadgroup const float4 * xs4, device const float * x, device const float * gamma, bool norm, uint g, thread XGroup & xg) {
+        Q4_0::load(xs4, x, gamma, norm, g, xg);   // the same element layout
+    }
+    static float dot(device const uchar * row, uint g, thread const XGroup & x) {
+        device const uchar * b = row + (g / 4) * 22;
+        const uint j0 = (g % 4) * 4, qh = high_bits(b), u = Q4_0::qword(b + 6 + j0);
+        const uint lo = (u & 0x0F0F0F0Fu) | kQ5High[(qh >> j0) & 15u], hi = ((u >> 4) & 0x0F0F0F0Fu) | kQ5High[(qh >> (j0 + 16)) & 15u];
+        return ld_half(b) * (metal::dot(bytes4(lo), x.a) + metal::dot(bytes4(hi), x.b) - 16.f * x.s.x);
+    }
+};
+
+// q8_0: group g = block g/4, elements 8q..8q+7 (q = g%4).
+struct Q8_0 {
+    enum { BLK = 32, BYTES = 34 };
+    static float elem(device const uchar * row, uint i) {
+        device const uchar * b = row + (i / 32) * 34;
+        return ld_half(b) * float(((device const char *)b)[2 + i % 32]);
+    }
+    static void load(threadgroup const float4 * xs4, device const float * x, device const float * gamma, bool norm, uint g, thread XGroup & xg) {
+        xg.a = xin4(xs4, x, gamma, norm, g * 8);
+        xg.b = xin4(xs4, x, gamma, norm, g * 8 + 4);
+    }
+    static float dot(device const uchar * row, uint g, thread const XGroup & x) {
+        device const uchar * b = row + (g / 4) * 34;
+        device const uchar * q = b + 2 + (g % 4) * 8;
+        const float4 v0 = float4(as_type<char4>(Q4_0::qword(q))), v1 = float4(as_type<char4>(Q4_0::qword(q + 4)));
+        return ld_half(b) * (metal::dot(v0, x.a) + metal::dot(v1, x.b));
+    }
+};
+
+// q4_K's 6-bit scale and min of sub-block j (ggml's get_scale_min_k4).
+static void scale_min_k4(uint j, device const uchar * q, thread float & d, thread float & m) {
+    if (j < 4) { d = float(q[j] & 63u); m = float(q[j + 4] & 63u); }
+    else { d = float((q[j + 4] & 15u) | ((q[j - 4] >> 6) << 4)); m = float((q[j + 4] >> 4) | ((q[j] >> 6) << 4)); }
+}
+
+// q4_K: group g = block g/32, t = g%32: 4 bytes at qs[32p + l] (p = t/8, l = 4(t%8)); low nibbles are elements 64p+l.. (sub-block 2p, a), high ones
+// 64p+32+l.. (sub-block 2p+1, b). The 144-byte blocks are 16-byte aligned: one 4-byte load.
+struct Q4_K {
+    enum { BLK = 256, BYTES = 144 };
+    static float elem(device const uchar * row, uint i) {
+        device const uchar * b = row + (i / 256) * 144;
+        const uint j = i % 256, c = j / 32, l = j % 32;
+        float sc, m;
+        scale_min_k4(c, b + 4, sc, m);
+        const uint q = b[16 + 32 * (c / 2) + l];
+        return ld_half(b) * sc * float((c & 1u) ? (q >> 4) : (q & 15u)) - ld_half(b + 2) * m;
+    }
+    static void load(threadgroup const float4 * xs4, device const float * x, device const float * gamma, bool norm, uint g, thread XGroup & xg) {
+        const uint t = g % 32, k = (g / 32) * 256 + 64 * (t / 8) + 4 * (t % 8);
+        xg.a = xin4(xs4, x, gamma, norm, k);
+        xg.b = xin4(xs4, x, gamma, norm, k + 32);
+        xg.s.x = hsum(xg.a);
+        xg.s.y = hsum(xg.b);
+    }
+    static float dot(device const uchar * row, uint g, thread const XGroup & x) {
+        device const uchar * b = row + (g / 32) * 144;
+        const uint t = g % 32, p = t / 8;
+        const uint u = *(device const uint *)(b + 16 + 32 * p + 4 * (t % 8));
+        float sc0, m0, sc1, m1;
+        scale_min_k4(2 * p, b + 4, sc0, m0);
+        scale_min_k4(2 * p + 1, b + 4, sc1, m1);
+        return ld_half(b) * (sc0 * metal::dot(bytes4(u & 0x0F0F0F0Fu), x.a) + sc1 * metal::dot(bytes4((u >> 4) & 0x0F0F0F0Fu), x.b)) - ld_half(b + 2) * (m0 * x.s.x + m1 * x.s.y);
+    }
+};
+
+// q6_K: group g = block g/32, t = g%32: half h = t/16, positions l, l+1 (l = 2(t%16)) of its four 32-element chunks k: elements 128h + 32k + l + {0, 1}
+// (a: chunks 0 and 1, b: chunks 2 and 3); two bytes each of ql[64h + l], ql[64h + 32 + l] and qh[32h + l] give all 8.
+struct Q6_K {
+    enum { BLK = 256, BYTES = 210 };
+    static float elem(device const uchar * row, uint i) {
+        device const uchar * b = row + (i / 256) * 210;
+        const uint j = i % 256, h = j / 128, k = (j % 128) / 32, l = j % 32;
+        const uint qlb = b[64 * h + (k & 1u) * 32 + l], low = k < 2 ? (qlb & 15u) : (qlb >> 4);
+        const uint hb = (b[128 + 32 * h + l] >> (2 * k)) & 3u;
+        const float sc = float(((device const char *)(b + 192))[8 * h + l / 16 + 2 * k]);
+        return ld_half(b + 208) * sc * float(int(low | (hb << 4)) - 32);
+    }
+    static void load(threadgroup const float4 * xs4, device const float * x, device const float * gamma, bool norm, uint g, thread XGroup & xg) {
+        const uint t = g % 32, k0 = (g / 32) * 256 + 128 * (t / 16) + 2 * (t % 16);
+        const float2 v0 = xin2(xs4, x, gamma, norm, k0), v1 = xin2(xs4, x, gamma, norm, k0 + 32), v2 = xin2(xs4, x, gamma, norm, k0 + 64),
+                     v3 = xin2(xs4, x, gamma, norm, k0 + 96);
+        xg.a = float4(v0, v1);
+        xg.b = float4(v2, v3);
+        xg.s = float4(v0.x + v0.y, v1.x + v1.y, v2.x + v2.y, v3.x + v3.y);
+    }
+    static float dot(device const uchar * row, uint g, thread const XGroup & x) {
+        device const uchar * b = row + (g / 32) * 210;
+        const uint t = g % 32, h = t / 16, l = 2 * (t % 16);
+        const uint q0 = *(device const ushort *)(b + 64 * h + l), q1 = *(device const ushort *)(b + 64 * h + 32 + l), qh = *(device const ushort *)(b + 128 + 32 * h + l);
+        // bytes (chunk 0 e0, e1, chunk 1 e0, e1) and (chunk 2 ..., chunk 3 ...): 4 low bits from ql, 2 high bits from qh
+        const uint w01 = ((q0 & 0x0F0Fu) | ((q1 & 0x0F0Fu) << 16)) | (((qh & 0x0303u) | (((qh >> 2) & 0x0303u) << 16)) << 4);
+        const uint w23 = (((q0 >> 4) & 0x0F0Fu) | (((q1 >> 4) & 0x0F0Fu) << 16)) | ((((qh >> 4) & 0x0303u) | (((qh >> 6) & 0x0303u) << 16)) << 4);
+        const float4 p01 = bytes4(w01) * x.a, p23 = bytes4(w23) * x.b;
+        device const char * sc = (device const char *)(b + 192) + 8 * h + l / 16;
+        return ld_half(b + 208) * (float(sc[0]) * (p01.x + p01.y - 32.f * x.s.x) + float(sc[2]) * (p01.z + p01.w - 32.f * x.s.y) +
+                                   float(sc[4]) * (p23.x + p23.y - 32.f * x.s.z) + float(sc[6]) * (p23.z + p23.w - 32.f * x.s.w));
+    }
+};
+
+// Rows a simdgroup computes in the quantized kernels (the host's constants of the same names): more than the f16 kernels, because each threadgroup's input
+// staging (and RMS) is a fixed cost and the quantized rows are cheap to read.
+constant constexpr uint kQuantRows = 2, kQuantGateRows = 2;
+
+// matvec1 / gate_up1 on quantized rows. The input comes normalized already (norm_vec) and is read from device memory (the kStageInput = false pipelines the
+// host uses for every quantized matrix): no staging and no barrier before the products. Each row's 8-element groups are split over S simdgroups (S = 1, 2
+// or 4 in flags bits 8..10, picked by the host from the row length so a lane gets several groups), which add their partial sums; a threadgroup computes
+// kQuantRows rows (gate_up: kQuantGateRows gate/up pairs) per S simdgroups.
+template <typename Q>
+kernel void matvec1q(device const uchar * W [[buffer(0)]], device const float * x [[buffer(1)]], device float * y [[buffer(2)]],
+                     device const float * gamma [[buffer(3)]], constant MatvecParams & p [[buffer(4)]], device const float * bias [[buffer(5)]],
+                     device const float * beta [[buffer(6)]], threadgroup float4 * xs4 [[threadgroup(0)]],
+                     uint gid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[kSimdgroupsPerGroup][kQuantRows];
+    const bool accumulate = (p.flags & 2u) != 0;
+    const uint S = (p.flags >> 8) & 7u, slots = kSimdgroupsPerGroup / S, slot = sg / S, piece = sg % S;
+    const uint row0 = (gid * slots + slot) * kQuantRows;
+    const ulong RB = ulong(p.K / Q::BLK) * Q::BYTES;
+    const uint NG = p.K / 8;
+    float acc[kQuantRows];
+    device const uchar * w[kQuantRows];
+    for (uint i = 0; i < kQuantRows; i++) { acc[i] = 0.f; w[i] = W + (ulong)min(row0 + i, p.N - 1) * RB; }
+    if (row0 < p.N) {
+        XGroup xg;
+        for (uint g = piece * 32 + lane; g < NG; g += S * 32) {
+            Q::load(xs4, x, gamma, false, g, xg);
+            for (uint i = 0; i < kQuantRows; i++) acc[i] += Q::dot(w[i], g, xg);
+        }
+    }
+    for (uint i = 0; i < kQuantRows; i++) { const float s = simd_sum(acc[i]); if (lane == 0) part[sg][i] = s; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < slots * kQuantRows) {
+        const uint sl = tid / kQuantRows, i = tid % kQuantRows, r = (gid * slots + sl) * kQuantRows + i;
+        if (r < p.N) {
+            float s = 0.f;
+            for (uint k = 0; k < S; k++) s += part[sl * S + k][i];
+            s += (p.flags & 4u) ? bias[r] : 0.f;
+            y[r] = accumulate ? y[r] + s : s;
+        }
+    }
+}
+
+template <typename Q>
+kernel void gate_up1q(device const uchar * Wg [[buffer(0)]], device const uchar * Wu [[buffer(1)]], device const float * x [[buffer(2)]],
+                      device float * h [[buffer(3)]], device const float * gamma [[buffer(4)]], constant MatvecParams & p [[buffer(5)]],
+                      threadgroup float4 * xs4 [[threadgroup(0)]], uint gid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[kSimdgroupsPerGroup][2 * kQuantGateRows];
+    const uint S = (p.flags >> 8) & 7u, slots = kSimdgroupsPerGroup / S, slot = sg / S, piece = sg % S;
+    const uint row0 = (gid * slots + slot) * kQuantGateRows;
+    const ulong RB = ulong(p.K / Q::BLK) * Q::BYTES;
+    const uint NG = p.K / 8;
+    float ag[kQuantGateRows], au[kQuantGateRows];
+    device const uchar * wg[kQuantGateRows];
+    device const uchar * wu[kQuantGateRows];
+    for (uint i = 0; i < kQuantGateRows; i++) {
+        const ulong r = min(row0 + i, p.N - 1);
+        ag[i] = 0.f; au[i] = 0.f; wg[i] = Wg + r * RB; wu[i] = Wu + r * RB;
+    }
+    if (row0 < p.N) {
+        XGroup xg;
+        for (uint g = piece * 32 + lane; g < NG; g += S * 32) {
+            Q::load(xs4, x, gamma, false, g, xg);
+            for (uint i = 0; i < kQuantGateRows; i++) { ag[i] += Q::dot(wg[i], g, xg); au[i] += Q::dot(wu[i], g, xg); }
+        }
+    }
+    for (uint i = 0; i < kQuantGateRows; i++) {
+        const float a = simd_sum(ag[i]), u = simd_sum(au[i]);
+        if (lane == 0) { part[sg][2 * i] = a; part[sg][2 * i + 1] = u; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < slots * kQuantGateRows) {
+        const uint sl = tid / kQuantGateRows, i = tid % kQuantGateRows, r = (gid * slots + sl) * kQuantGateRows + i;
+        if (r < p.N) {
+            float a = 0.f, u = 0.f;
+            for (uint k = 0; k < S; k++) { a += part[sl * S + k][2 * i]; u += part[sl * S + k][2 * i + 1]; }
+            h[r] = a / (1.f + exp(-a)) * u;
+        }
+    }
+}
+
+// xn = x * rsqrt(mean(x^2) + eps) * gamma, one row (n a multiple of 4), one threadgroup: the normalized input of the quantized one-token kernels.
+kernel void norm_vec(device const float * x [[buffer(0)]], device float * xn [[buffer(1)]], device const float * gamma [[buffer(2)]],
+                     constant MatvecParams & p [[buffer(3)]], uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float red[kSimdgroupsPerGroup];
+    device const float4 * x4 = (device const float4 *)x;
+    float ss = 0.f;
+    for (uint k = tid; k < p.K / 4; k += kGroupThreads) { const float4 v = x4[k]; ss += dot(v, v); }
+    ss = simd_sum(ss);
+    if (lane == 0) red[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.f;
+    for (uint i = 0; i < kSimdgroupsPerGroup; i++) total += red[i];
+    const float inv = rsqrt(total / float(p.K) + p.eps);
+    for (uint k = tid; k < p.K / 4; k += kGroupThreads) ((device float4 *)xn)[k] = x4[k] * inv * ((device const float4 *)gamma)[k];
+}
+
+// x[row][:] = table[tokens[token_index + row]][:] from a quantized embedding table.
+template <typename Q>
+kernel void embedq(device const uchar * table [[buffer(0)]], device const int * tokens [[buffer(1)]], device float * x [[buffer(2)]],
+                   constant EmbedParams & p [[buffer(3)]], device const float * pos_table [[buffer(4)]], uint2 gp [[thread_position_in_grid]]) {
+    const uint i = gp.x, row = gp.y;
+    if (i >= p.n_embd) return;
+    const ulong RB = ulong(p.n_embd / Q::BLK) * Q::BYTES;
+    x[(ulong)row * p.n_embd + i] = Q::elem(table + (ulong)tokens[p.token_index + row] * RB, i);
+}
+
+struct DequantParams { uint K; uint rows; };
+
+// out[r][k] = half(W[r][k]) for the prefill matmuls (rows x K elements, one thread each).
+template <typename Q>
+kernel void dequant_half(device const uchar * W [[buffer(0)]], device half * out [[buffer(1)]], constant DequantParams & p [[buffer(2)]],
+                         uint2 gp [[thread_position_in_grid]]) {
+    const uint k = gp.x, r = gp.y;
+    if (k >= p.K || r >= p.rows) return;
+    out[(ulong)r * p.K + k] = half(Q::elem(W + (ulong)r * (ulong(p.K / Q::BLK) * Q::BYTES), k));
+}
+
+#define DOOMS_QUANT_KERNELS(Q) \
+    template [[host_name("matvec1_" #Q)]] kernel void matvec1q<Q>(device const uchar *, device const float *, device float *, device const float *, \
+        constant MatvecParams &, device const float *, device const float *, threadgroup float4 *, uint, uint, uint, uint); \
+    template [[host_name("gate_up1_" #Q)]] kernel void gate_up1q<Q>(device const uchar *, device const uchar *, device const float *, device float *, \
+        device const float *, constant MatvecParams &, threadgroup float4 *, uint, uint, uint, uint); \
+    template [[host_name("embed_" #Q)]] kernel void embedq<Q>(device const uchar *, device const int *, device float *, constant EmbedParams &, \
+        device const float *, uint2); \
+    template [[host_name("dequant_" #Q)]] kernel void dequant_half<Q>(device const uchar *, device half *, constant DequantParams &, uint2);
+DOOMS_QUANT_KERNELS(Q4_0)
+DOOMS_QUANT_KERNELS(Q5_0)
+DOOMS_QUANT_KERNELS(Q8_0)
+DOOMS_QUANT_KERNELS(Q4_K)
+DOOMS_QUANT_KERNELS(Q6_K)
 )MSL";
+    return source.c_str();
 }
 
 }  // namespace dooms

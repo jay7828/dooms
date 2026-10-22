@@ -4,7 +4,9 @@ namespace dooms {
 
 namespace {
 
-double bytes_of(const TypeInfo & t) { return static_cast<double>(t.shape.numel()) * static_cast<double>(dtype_size(t.dtype)); }
+double bytes_of(const TypeInfo & t) {
+    return static_cast<double>(t.shape.numel()) / static_cast<double>(dtype_block_elems(t.dtype)) * static_cast<double>(dtype_block_bytes(t.dtype));
+}
 
 }  // namespace
 

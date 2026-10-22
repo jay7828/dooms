@@ -364,3 +364,15 @@ div.proj { cursor: default; }
 .proj-grid.three .proj:not(.big) .proj-img { aspect-ratio: 16 / 9; }
 @media (max-width: 860px) { .proj-grid.three { grid-template-columns: 1fr; } .proj-grid.three .proj.big { grid-row: auto; } .proj-grid.three .proj.big .proj-img { aspect-ratio: 16 / 10; flex: none; } }
 .proj-grid.three .proj.big .proj-img img { object-position: left 30%; }
+
+/* the 4-bit headline band */
+.claim { padding: 72px 24px 24px; border-top: 1px solid var(--line); }
+.claim h2 { margin: 0; }
+.claim-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin: 32px 0 24px; max-width: 760px; }
+.claim-stat { display: flex; flex-direction: column; gap: 6px; }
+.claim-num { font-size: clamp(2rem, 1.4rem + 2vw, 3.1rem); font-weight: 600; letter-spacing: -0.03em; line-height: 1.1; color: var(--pop); font-variant-numeric: tabular-nums; }
+.claim-num.dim { color: var(--ink-3); }
+.claim-label { color: var(--ink-2); font-size: 14px; }
+.claim-code { max-width: 760px; }
+.claim-code pre { overflow-x: auto; }
+@media (max-width: 560px) { .claim { padding-left: 16px; padding-right: 16px; } .claim-row { grid-template-columns: 1fr; gap: 12px; } }

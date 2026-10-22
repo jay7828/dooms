@@ -9,6 +9,7 @@
 
 #include "backend/coreml/coreml_model.h"
 #include "backend/kokoro_vocoder.h"
+#include "core/parallel.h"
 #include "core/tensor.h"
 #include "format/gguf.h"
 #include "pipeline/kokoro_vocoder_loader.h"
@@ -91,15 +92,18 @@ void kokoro_align(const std::vector<float> & durations, const std::vector<float>
 void kokoro_sine_source(const std::vector<float> & f0, const KokoroNoise & nz, const KokoroSourceConfig & c, const float * w, float b, std::vector<float> * out) {
     const int64_t up = c.upsample, H = c.harmonics, L = static_cast<int64_t>(f0.size()) * up, D = static_cast<int64_t>(f0.size());
     std::vector<float> rad(static_cast<size_t>(L * H));
-    for (int64_t t = 0; t < L; t++) {
-        const float f = f0[static_cast<size_t>(t / up)];   // nearest upsampling
-        for (int64_t h = 0; h < H; h++) {
-            const float v = f * static_cast<float>(h + 1) / static_cast<float>(c.sample_rate);
-            float r = std::fmod(v, 1.f);
-            if (r != 0.f && r < 0.f) r += 1.f;   // numpy / torch: the remainder takes the divisor's sign
-            rad[static_cast<size_t>(t * H + h)] = r;
+    // The per-sample loops run on several threads: each sample's values depend on its own inputs only, so the results equal one thread's.
+    parallel_for(L, H * 8, [&](int64_t t0, int64_t t1) {
+        for (int64_t t = t0; t < t1; t++) {
+            const float f = f0[static_cast<size_t>(t / up)];   // nearest upsampling
+            for (int64_t h = 0; h < H; h++) {
+                const float v = f * static_cast<float>(h + 1) / static_cast<float>(c.sample_rate);
+                float r = std::fmod(v, 1.f);
+                if (r != 0.f && r < 0.f) r += 1.f;   // numpy / torch: the remainder takes the divisor's sign
+                rad[static_cast<size_t>(t * H + h)] = r;
+            }
         }
-    }
+    });
     for (int64_t h = 1; h < H; h++) rad[static_cast<size_t>(h)] += nz.rand_ini[static_cast<size_t>(h)];   // the fundamental starts at phase 0
     std::vector<float> down(static_cast<size_t>(D * H)), phase(static_cast<size_t>(D * H)), up_phase(static_cast<size_t>(L * H));
     interp_linear(rad.data(), L, static_cast<int>(H), D, static_cast<float>(up), down.data());
@@ -113,17 +117,19 @@ void kokoro_sine_source(const std::vector<float> & f0, const KokoroNoise & nz, c
     interp_linear(phase.data(), D, static_cast<int>(H), L, 1.f / static_cast<float>(up), up_phase.data());
     out->assign(static_cast<size_t>(L), 0.f);
     const float unvoiced_amp = c.sine_amp / 3.f;
-    for (int64_t t = 0; t < L; t++) {
-        const float uv = f0[static_cast<size_t>(t / up)] > c.voiced_threshold ? 1.f : 0.f;
-        const float amp = uv * c.noise_std + (1.f - uv) * unvoiced_amp;
-        float acc = 0.f;
-        for (int64_t h = 0; h < H; h++) {
-            const size_t i = static_cast<size_t>(t * H + h);
-            const float s = std::sin(up_phase[i]) * c.sine_amp * uv + amp * nz.noise[i];
-            acc += s * w[h];
+    parallel_for(L, H * 16, [&](int64_t t0, int64_t t1) {
+        for (int64_t t = t0; t < t1; t++) {
+            const float uv = f0[static_cast<size_t>(t / up)] > c.voiced_threshold ? 1.f : 0.f;
+            const float amp = uv * c.noise_std + (1.f - uv) * unvoiced_amp;
+            float acc = 0.f;
+            for (int64_t h = 0; h < H; h++) {
+                const size_t i = static_cast<size_t>(t * H + h);
+                const float s = std::sin(up_phase[i]) * c.sine_amp * uv + amp * nz.noise[i];
+                acc += s * w[h];
+            }
+            (*out)[static_cast<size_t>(t)] = std::tanh(acc + b);
         }
-        (*out)[static_cast<size_t>(t)] = std::tanh(acc + b);
-    }
+    });
 }
 
 void kokoro_stft(const std::vector<float> & x, int32_t n_fft, int32_t hop, std::vector<float> * out, int32_t * frames) {
@@ -145,8 +151,9 @@ void kokoro_stft(const std::vector<float> & x, int32_t n_fft, int32_t hop, std::
         cs[static_cast<size_t>(k * n_fft + i)] = std::cos(a);
         sn[static_cast<size_t>(k * n_fft + i)] = -std::sin(a);
     }
+    parallel_for(fr, static_cast<int64_t>(bins) * n_fft * 4, [&](int64_t f0, int64_t f1) {   // frames are independent: the same values as one thread
     std::vector<double> seg(static_cast<size_t>(n_fft));
-    for (int32_t f = 0; f < fr; f++) {
+    for (int32_t f = static_cast<int32_t>(f0); f < static_cast<int32_t>(f1); f++) {
         for (int i = 0; i < n_fft; i++) seg[static_cast<size_t>(i)] = at(static_cast<int64_t>(f) * hop + i) * win[static_cast<size_t>(i)];
         for (int k = 0; k < bins; k++) {
             double re = 0, im = 0;
@@ -158,6 +165,7 @@ void kokoro_stft(const std::vector<float> & x, int32_t n_fft, int32_t hop, std::
             (*out)[static_cast<size_t>(bins + k) * fr + f] = static_cast<float>(std::atan2(im, re));
         }
     }
+    });
 }
 
 void kokoro_istft(const std::vector<float> & x, int32_t frames, int32_t n_fft, int32_t hop, std::vector<float> * out) {
@@ -165,24 +173,34 @@ void kokoro_istft(const std::vector<float> & x, int32_t frames, int32_t n_fft, i
     const int64_t total = n_fft + static_cast<int64_t>(hop) * (frames - 1), length = static_cast<int64_t>(hop) * (frames - 1);
     std::vector<double> acc(static_cast<size_t>(total), 0.0), env(static_cast<size_t>(total), 0.0), win(static_cast<size_t>(n_fft));
     for (int i = 0; i < n_fft; i++) win[static_cast<size_t>(i)] = hann(i, n_fft);
-    std::vector<double> cs(static_cast<size_t>(bins * n_fft)), sn(static_cast<size_t>(bins * n_fft)), re(static_cast<size_t>(bins)), im(static_cast<size_t>(bins));
+    std::vector<double> cs(static_cast<size_t>(bins * n_fft)), sn(static_cast<size_t>(bins * n_fft));
     for (int k = 0; k < bins; k++) for (int i = 0; i < n_fft; i++) {
         const double a = 2.0 * kPi * k * i / n_fft;
         cs[static_cast<size_t>(k * n_fft + i)] = std::cos(a);
         sn[static_cast<size_t>(k * n_fft + i)] = std::sin(a);
     }
-    for (int32_t f = 0; f < frames; f++) {
-        for (int k = 0; k < bins; k++) {
-            const double mag = std::exp(static_cast<double>(x[static_cast<size_t>(k) * frames + f]));
-            const double ph = std::sin(static_cast<double>(x[static_cast<size_t>(bins + k) * frames + f]));
-            re[static_cast<size_t>(k)] = mag * std::cos(ph);
-            im[static_cast<size_t>(k)] = mag * std::sin(ph);
+    // Each frame's inverse DFT on several threads into its own row, then the overlap-add in frame order (the same sums in the same order as one thread).
+    std::vector<double> rows(static_cast<size_t>(frames) * static_cast<size_t>(n_fft));
+    parallel_for(frames, static_cast<int64_t>(bins) * n_fft * 4, [&](int64_t f0, int64_t f1) {
+        std::vector<double> re(static_cast<size_t>(bins)), im(static_cast<size_t>(bins));
+        for (int64_t f = f0; f < f1; f++) {
+            for (int k = 0; k < bins; k++) {
+                const double mag = std::exp(static_cast<double>(x[static_cast<size_t>(k) * frames + f]));
+                const double ph = std::sin(static_cast<double>(x[static_cast<size_t>(bins + k) * frames + f]));
+                re[static_cast<size_t>(k)] = mag * std::cos(ph);
+                im[static_cast<size_t>(k)] = mag * std::sin(ph);
+            }
+            for (int i = 0; i < n_fft; i++) {   // irfft: the imaginary parts of DC and Nyquist are ignored (numpy, torch)
+                double v = re[0] + re[static_cast<size_t>(bins - 1)] * ((i & 1) ? -1.0 : 1.0);
+                for (int k = 1; k < bins - 1; k++) v += 2.0 * (re[static_cast<size_t>(k)] * cs[static_cast<size_t>(k * n_fft + i)] - im[static_cast<size_t>(k)] * sn[static_cast<size_t>(k * n_fft + i)]);
+                rows[static_cast<size_t>(f) * static_cast<size_t>(n_fft) + static_cast<size_t>(i)] = v;
+            }
         }
-        for (int i = 0; i < n_fft; i++) {   // irfft: the imaginary parts of DC and Nyquist are ignored (numpy, torch)
-            double v = re[0] + re[static_cast<size_t>(bins - 1)] * ((i & 1) ? -1.0 : 1.0);
-            for (int k = 1; k < bins - 1; k++) v += 2.0 * (re[static_cast<size_t>(k)] * cs[static_cast<size_t>(k * n_fft + i)] - im[static_cast<size_t>(k)] * sn[static_cast<size_t>(k * n_fft + i)]);
+    });
+    for (int32_t f = 0; f < frames; f++) {
+        for (int i = 0; i < n_fft; i++) {
             const size_t o = static_cast<size_t>(static_cast<int64_t>(f) * hop + i);
-            acc[o] += v / n_fft * win[static_cast<size_t>(i)];
+            acc[o] += rows[static_cast<size_t>(f) * static_cast<size_t>(n_fft) + static_cast<size_t>(i)] / n_fft * win[static_cast<size_t>(i)];
             env[o] += win[static_cast<size_t>(i)] * win[static_cast<size_t>(i)];
         }
     }
@@ -196,12 +214,18 @@ KokoroNoise kokoro_draw_noise(int64_t samples, int32_t harmonics, uint64_t seed)
     n.rand_ini.resize(static_cast<size_t>(harmonics));
     for (float & v : n.rand_ini) v = static_cast<float>(rng.uniform());
     n.noise.resize(static_cast<size_t>(samples * harmonics));
-    for (size_t i = 0; i < n.noise.size(); i += 2) {   // Box-Muller, two normals per pair of uniforms
-        const double u1 = 1.0 - rng.uniform(), u2 = rng.uniform();
-        const double r = std::sqrt(-2.0 * std::log(u1)), a = 2.0 * kPi * u2;
-        n.noise[i] = static_cast<float>(r * std::cos(a));
-        if (i + 1 < n.noise.size()) n.noise[i + 1] = static_cast<float>(r * std::sin(a));
-    }
+    // Box-Muller, two normals per pair of uniforms: the uniforms drawn in sequence (the generator's order), the transforms on several threads.
+    const int64_t pairs = static_cast<int64_t>((n.noise.size() + 1) / 2);
+    std::vector<double> u(static_cast<size_t>(2 * pairs));
+    for (int64_t p = 0; p < pairs; p++) { u[static_cast<size_t>(2 * p)] = 1.0 - rng.uniform(); u[static_cast<size_t>(2 * p + 1)] = rng.uniform(); }
+    parallel_for(pairs, 64, [&](int64_t p0, int64_t p1) {
+        for (int64_t p = p0; p < p1; p++) {
+            const size_t i = static_cast<size_t>(2 * p);
+            const double r = std::sqrt(-2.0 * std::log(u[i])), a = 2.0 * kPi * u[i + 1];
+            n.noise[i] = static_cast<float>(r * std::cos(a));
+            if (i + 1 < n.noise.size()) n.noise[i + 1] = static_cast<float>(r * std::sin(a));
+        }
+    });
     return n;
 }
 
