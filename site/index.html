@@ -133,10 +133,6 @@ scripts/reproduce-4bit.sh   <span class="c"># builds, downloads pinned models, p
           <div class="loss-num"><span data-count="4256">4256</span> vs <span data-count="3975">3975</span></div>
           <p>tokens per second reading a 512-token prompt at 4-bit (Q4_0), llama.cpp against the engine. Ahead of MLX-LM (3814) at every prompt length measured; llama.cpp's matmul kernel is still faster.</p>
         </div>
-        <div class="loss rise-in">
-          <div class="loss-num"><span data-count="15" data-suffix="x">15x</span></div>
-          <p>more error in the SmolVLA action chunk on the Neural Engine (1.2e-2) than on the GPU (7.5e-4). The speed costs precision.</p>
-        </div>
       </div>
     </section>
 

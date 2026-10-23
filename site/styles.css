@@ -154,7 +154,7 @@ td.num, th.num { text-align: right; font-family: "Geist Mono", ui-monospace, mon
 
 /* losses */
 .losses { padding: 96px 24px; border-top: 1px solid var(--line); }
-.loss-grid { display: grid; grid-template-columns: 1.3fr 1fr 1fr; gap: 0; margin-top: 44px; }
+.loss-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0; margin-top: 44px; }
 .loss { padding: 0 28px; border-left: 1px solid var(--line); }
 .loss:first-child { padding-left: 0; border-left: 0; }
 .loss-num { font-size: clamp(2rem, 1.4rem + 2vw, 3.1rem); font-weight: 600; letter-spacing: -0.03em; color: var(--ink-3); line-height: 1.1; }

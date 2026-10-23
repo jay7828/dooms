@@ -1,9 +1,11 @@
 # dooms.cpp
 
-An inference engine for Apple Silicon that runs language, vision-language and vision-language-action models from C++, C and Python, on the GPU (Metal) and the
-Neural Engine (Core ML).
+An inference engine for Apple Silicon that runs language, speech (Whisper, Kokoro text to speech), vision-language and vision-language-action models from C++,
+C and Python, on the GPU (Metal) and the Neural Engine (Core ML).
 
-- **LLMs**: its own Metal decoder for llama and Qwen2 models in f16 (fused kernels, flash-attention prompt processing, the next token picked on the GPU), and
+![dooms-cli on an M1 Pro: Whisper large-v3-turbo transcribes 29.4 s of speech in 1.2 s, Kokoro speaks 2.8 s in 158 ms, Qwen2.5-0.5B (4-bit) answers at 307 tokens/s](site/demo.gif)
+
+- **LLMs**: its own Metal decoder for llama and Qwen2 models in f16 and 4-bit GGUF (Q4_0, Q4_K_M and their q5_0/q8_0/q6_K parts; fused kernels, flash-attention prompt processing, the next token picked on the GPU), and
   any other GGUF through [llama.cpp](https://github.com/ggml-org/llama.cpp) (every architecture and quantization). Chat templates, streaming, stop strings,
   seeded sampling, and an OpenAI-compatible server (`dooms serve`).
 - **Vision-language** (SmolVLM): the vision tower on the Neural Engine, the language model on the engine's own decoder.
