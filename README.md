@@ -3,7 +3,10 @@
 An inference engine for Apple Silicon that runs language, speech (Whisper, Kokoro text to speech), vision-language and vision-language-action models from C++,
 C and Python, on the GPU (Metal) and the Neural Engine (Core ML).
 
-![dooms-cli on an M1 Pro: Whisper large-v3-turbo transcribes 29.4 s of speech in 1.2 s, Kokoro speaks 2.8 s in 158 ms, Qwen2.5-0.5B (4-bit) answers at 307 tokens/s](site/demo.gif)
+![dooms-cli on an M1 Pro: Whisper large-v3-turbo transcribes 29.4 s of speech in 1.2 s, Kokoro speaks 2.8 s in 158 ms, Qwen2.5-0.5B (4-bit) answers a short question at 307 tokens/s](site/demo.gif)
+
+*Real output of the 0.6.1 release on an M1 Pro (warm runs). The LLM answers a 19-token question here, so it decodes faster (307 tokens/s) than in the
+benchmark below, which decodes after a 512-token prompt (256 tokens/s): the more context, the more attention work per token.*
 
 - **LLMs**: its own Metal decoder for llama and Qwen2 models in f16 and 4-bit GGUF (Q4_0, Q4_K_M and their q5_0/q8_0/q6_K parts; fused kernels, flash-attention prompt processing, the next token picked on the GPU), and
   any other GGUF through [llama.cpp](https://github.com/ggml-org/llama.cpp) (every architecture and quantization). Chat templates, streaming, stop strings,
