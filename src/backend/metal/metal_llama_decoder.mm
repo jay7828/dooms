@@ -26,6 +26,9 @@ constexpr uint32_t kGateRowsPerGroup = kGateRowsPerSimdgroup * kSimdgroupsPerGro
 // The quantized matvec1 / gate_up1 (llama_kernels.h kQuantRows / kQuantGateRows): rows (gate/up pairs) per threadgroup, the row's work split over its
 // simdgroups. Measured: src/backend/metal/CLAUDE.md "Quantized matrices".
 constexpr uint32_t kQuantRows = 2, kQuantGateRows = 2;
+// Prefill chunks of fewer tokens unpack the quantized weight tiles inside the matmuls (no extra pass); longer ones dequantize each matrix to half once
+// first, because the fused kernels unpack every tile again per 32 tokens. Crossover measured: src/backend/metal/CLAUDE.md "Quantized matrices".
+constexpr uint32_t kFusedMaxTokens = 320;
 // A decode step attends over the cache split into chunks of positions (attention_split + attention_combine, flash-decoding) from kSplitMinPositions on, so
 // that n_head x splits threadgroups fill the GPU (one threadgroup per head starves it on long contexts); chunks of at least kSplitMinChunk positions.
 constexpr uint32_t kSplitMinPositions = 512, kSplitMinChunk = 64, kSplitTargetGroups = 128;
@@ -58,7 +61,7 @@ struct ArgmaxParams { uint32_t n, out_index, use_mask; };
 struct DequantParams { uint32_t K, rows; };
 struct SplitParams { uint32_t n_head, head_dim, q_stride, kv_stride, n_keys, chunk, n_split, out_stride; float scale; uint32_t group; };
 static_assert(sizeof(MatvecParams) == 16 && sizeof(GemmParams) == 28 && sizeof(AttnParams) == 44 && sizeof(EmbedParams) == 16 && sizeof(ArgmaxParams) == 12 &&
-              sizeof(DequantParams) == 8 && sizeof(SplitParams) == 40, "parameter structs must match the kernel source field for field");
+              sizeof(SplitParams) == 40 && sizeof(DequantParams) == 8, "parameter structs must match the kernel source field for field");
 
 // Weight matrix types the decoder runs, in the order of the per-type kernel tables; the kernel names' suffixes (llama_kernels.h DOOMS_QUANT_KERNELS).
 constexpr DType kMatTypes[] = {DType::F16, DType::Q4_0, DType::Q5_0, DType::Q8_0, DType::Q4_K, DType::Q6_K};
@@ -93,13 +96,14 @@ struct MetalLlamaDecoder::Impl {
     bool big = false;        // the current encode_forward call uses the 64x32 kernels
     bool big_capable = false;  // every reduction length (n_embd, n_head*head_dim, n_ff) is a multiple of kBigK
     id<MTLComputePipelineState> p_matvec1_direct, p_gate_up1_direct;  // kStageInput = false variants (long input rows)
-    // Per matrix type (kMatTypes; index 0, f16, aliases the pipelines above): one-token kernels (staged / direct input), embedding lookup, dequantization
-    // to half for the prefill matmuls. Built for the types the model uses.
-    id<MTLComputePipelineState> __strong mv[kNumMatTypes], mv_direct[kNumMatTypes], gu[kNumMatTypes], gu_direct[kNumMatTypes], emb[kNumMatTypes], deq[kNumMatTypes];
+    // Per matrix type (kMatTypes; index 0, f16, aliases the pipelines above): one-token kernels (staged / direct input), embedding lookup, and the prefill
+    // matmuls (16x16 and 64x32 tiles, plain and gate/up) that unpack the quantized weight tiles as they stage them. Built for the types the model uses.
+    id<MTLComputePipelineState> __strong mv[kNumMatTypes], mv_direct[kNumMatTypes], gu[kNumMatTypes], gu_direct[kNumMatTypes], emb[kNumMatTypes];
+    id<MTLComputePipelineState> __strong mm_small[kNumMatTypes], mm_big[kNumMatTypes], gu_small[kNumMatTypes], gu_big[kNumMatTypes], deq[kNumMatTypes];
+    id<MTLBuffer> scratch;   // half copies of the quantized matrices a long prefill chunk reads (gate and up side by side); nil for an f16 model
+    size_t scratch_half_off = 0;   // byte offset of the second matrix (up) in scratch
     id<MTLComputePipelineState> p_norm_vec;   // the quantized one-token kernels' input normalization (nil for an f16 model)
     id<MTLBuffer> xn;        // that normalized input row
-    id<MTLBuffer> scratch;   // half copies of the quantized matrices a prefill matmul reads (gate and up side by side); nil for an f16 model
-    size_t scratch_half_off = 0;   // byte offset of the second matrix (up) in scratch
     DType embd_type = DType::F16, output_type = DType::F16;
     uint32_t argmax_threads = 0;
     id<MTLBuffer> weights, kc, vc, x, qkv, attn, h, logits_buf, tokens, in_tokens, scale;  // scale: per-token RMS scales of a prefill chunk
@@ -196,7 +200,7 @@ struct MetalLlamaDecoder::Impl {
     }
 
     // Several tokens: Y[M][N] (+)= X . W^T (X optionally RMS-normalized with gamma).
-    // A quantized matrix as half rows [rows][K] at scratch + off (the prefill matmuls read half weights).
+    // A quantized matrix as half rows [rows][K] at scratch + off (the f16 matmuls then read it): long prefill chunks.
     void dequant(id<MTLComputeCommandEncoder> enc0, MatRef w, uint32_t K, uint32_t rows, size_t off) {
         id<MTLComputeCommandEncoder> enc = enc_now(enc0);
         DequantParams dp{K, rows};
@@ -210,13 +214,14 @@ struct MetalLlamaDecoder::Impl {
 
     void matmul(id<MTLComputeCommandEncoder> enc0, const char * kind, MatRef w, id<MTLBuffer> xb, id<MTLBuffer> yb, size_t gamma,
                 uint32_t K, uint32_t N, uint32_t M, uint32_t x_stride, uint32_t y_stride, uint32_t flags, size_t bias = 0, size_t y_off = 0) {
-        id<MTLBuffer> wb = weights;
-        size_t w_off = w.off;
-        if (w.dt != DType::F16) { dequant(enc0, w, K, N, 0); wb = scratch; w_off = 0; }
+        // quantized: tiles unpacked in the kernel (short chunks), or the matrix dequantized once into scratch and the f16 kernel (long chunks)
+        const bool once = w.dt != DType::F16 && M >= kFusedMaxTokens;
+        if (once) dequant(enc0, w, K, N, 0);
         id<MTLComputeCommandEncoder> enc = enc_now(enc0);
         GemmParams p{K, N, M, x_stride, y_stride, flags, cfg.rms_eps};
-        [enc setComputePipelineState:big ? p_matmul_big : p_matmul];
-        [enc setBuffer:wb offset:w_off atIndex:0];
+        const int t = once ? 0 : mat_type_index(w.dt);
+        [enc setComputePipelineState:big ? mm_big[t] : mm_small[t]];
+        [enc setBuffer:once ? scratch : weights offset:once ? 0 : w.off atIndex:0];
         [enc setBuffer:xb offset:0 atIndex:1];
         [enc setBuffer:yb offset:y_off atIndex:2];
         [enc setBuffer:weights offset:gamma atIndex:3];
@@ -346,13 +351,14 @@ struct MetalLlamaDecoder::Impl {
                 attention(enc0, cache_off, M, p0, false);
                 matmul(enc0, "attn_output", L.attn_output, attn, x, 0, q_width, E, M, q_width, E, kFlagAccumulate);
                 if (big) rms_scale(enc0, M);
-                const bool quant = L.ffn_gate.dt != DType::F16;
-                if (quant) { dequant(enc0, L.ffn_gate, E, F, 0); dequant(enc0, L.ffn_up, E, F, scratch_half_off); }
+                const bool once = L.ffn_gate.dt != DType::F16 && M >= kFusedMaxTokens;
+                if (once) { dequant(enc0, L.ffn_gate, E, F, 0); dequant(enc0, L.ffn_up, E, F, scratch_half_off); }
                 id<MTLComputeCommandEncoder> enc = enc_now(enc0);
                 GemmParams gp{E, F, M, E, F, kFlagNorm, cfg.rms_eps};
-                [enc setComputePipelineState:big ? p_gate_up_big : p_matmul_gate_up];
-                [enc setBuffer:quant ? scratch : weights offset:quant ? 0 : L.ffn_gate.off atIndex:0];
-                [enc setBuffer:quant ? scratch : weights offset:quant ? scratch_half_off : L.ffn_up.off atIndex:1];
+                const int gt = once ? 0 : mat_type_index(L.ffn_gate.dt);
+                [enc setComputePipelineState:big ? gu_big[gt] : gu_small[gt]];
+                [enc setBuffer:once ? scratch : weights offset:once ? 0 : L.ffn_gate.off atIndex:0];
+                [enc setBuffer:once ? scratch : weights offset:once ? scratch_half_off : L.ffn_up.off atIndex:1];
                 [enc setBuffer:x offset:0 atIndex:2];
                 [enc setBuffer:h offset:0 atIndex:3];
                 [enc setBuffer:weights offset:L.ffn_norm atIndex:4];
@@ -535,6 +541,7 @@ Result<std::unique_ptr<MetalLlamaDecoder>> MetalLlamaDecoder::create(const Llama
         if (Status s = pipeline_with("matvec1", false, m.p_matvec1_direct); !s.is_ok()) return s;
         if (Status s = pipeline_with("gate_up1", false, m.p_gate_up1_direct); !s.is_ok()) return s;
         m.mv[0] = m.p_matvec1; m.mv_direct[0] = m.p_matvec1_direct; m.gu[0] = m.p_gate_up1; m.gu_direct[0] = m.p_gate_up1_direct; m.emb[0] = m.p_embed;
+        m.mm_small[0] = m.p_matmul; m.mm_big[0] = m.p_matmul_big; m.gu_small[0] = m.p_matmul_gate_up; m.gu_big[0] = m.p_gate_up_big;
         // The quantized types this model uses.
         bool used[kNumMatTypes] = {};
         auto use = [&](const WeightRef & r) { if (r.data) used[mat_type_index(r.dtype)] = true; };
@@ -553,7 +560,9 @@ Result<std::unique_ptr<MetalLlamaDecoder>> MetalLlamaDecoder::create(const Llama
             const std::string sfx = std::string("_") + kMatSuffix[t];
             for (auto & [name, stage, slot] : std::initializer_list<std::tuple<std::string, bool, id<MTLComputePipelineState> __strong *>>{
                      {"matvec1" + sfx, true, &m.mv[t]}, {"matvec1" + sfx, false, &m.mv_direct[t]}, {"gate_up1" + sfx, true, &m.gu[t]},
-                     {"gate_up1" + sfx, false, &m.gu_direct[t]}, {"embed" + sfx, true, &m.emb[t]}, {"dequant" + sfx, true, &m.deq[t]}}) {
+                     {"gate_up1" + sfx, false, &m.gu_direct[t]}, {"embed" + sfx, true, &m.emb[t]}, {"matmul_16x16" + sfx, true, &m.mm_small[t]},
+                     {"matmul_big" + sfx, true, &m.mm_big[t]}, {"matmul_gate_up_16x16" + sfx, true, &m.gu_small[t]},
+                     {"matmul_gate_up_big" + sfx, true, &m.gu_big[t]}, {"dequant" + sfx, true, &m.deq[t]}}) {
                 if (Status s = pipeline_with(name.c_str(), stage, *slot); !s.is_ok()) return s;
                 if ((*slot).maxTotalThreadsPerThreadgroup < kGroupThreads) return unsupported("kernel " + name + " cannot run " + std::to_string(kGroupThreads) + " threads per group on this GPU");
             }
@@ -668,7 +677,7 @@ Result<std::unique_ptr<MetalLlamaDecoder>> MetalLlamaDecoder::create(const Llama
                   &m.split_part, "split attention partials"}}) {
             if (Status s = buffer(bytes, *slot, what); !s.is_ok()) return s;
         }
-        if (any_quant) {   // the largest matrix a prefill matmul dequantizes, gate and up together
+        if (any_quant) {   // the largest matrix a long prefill chunk dequantizes, gate and up together
             const size_t gate_bytes = static_cast<size_t>(F) * static_cast<size_t>(E) * 2;
             m.scratch_half_off = align_up(gate_bytes, kWeightAlign);
             const size_t need = std::max<size_t>({2 * m.scratch_half_off, static_cast<size_t>(m.qkv_width) * static_cast<size_t>(E) * 2, static_cast<size_t>(E) * m.q_width * 2});

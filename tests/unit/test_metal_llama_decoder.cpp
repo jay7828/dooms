@@ -421,6 +421,39 @@ TEST(quantized_matrices_match_the_reference) {
             }
         }
     }
+    // Longer prompts in one call: 120 tokens (the 64x32 kernels unpacking the quantized tiles) and 330 (from 320 tokens on, each matrix dequantized to half
+    // once first), every format, against the reference; then a decode step.
+    for (const QuantPlan & plan : {QuantPlan{"q4_0", Q40, Q40, Q40, Q40, Q40, Q40, Q40, Q40, Q40}, QuantPlan{"q5_0", Q50, Q50, Q50, Q50, Q50, Q50, Q50, Q50, Q50},
+                                   QuantPlan{"q8_0", Q80, Q80, Q80, Q80, Q80, Q80, Q80, Q80, Q80}, QuantPlan{"q4_K", Q4K, Q4K, Q4K, Q4K, Q4K, Q4K, Q4K, Q4K, Q4K},
+                                   QuantPlan{"q6_K", Q6K, Q6K, Q6K, Q6K, Q6K, Q6K, Q6K, Q6K, Q6K},
+                                   QuantPlan{"Q4_K_M-like mix", Q80, Q6K, Q50, Q50, Q80, Q50, Q50, Q4K, Q6K}}) {
+        bool exact_long = true;
+        QuantTiny qt = make_quant(plan, 31, &exact_long);
+        qt.ref.cfg.n_ctx = 400;
+        qt.ref.cfg.n_batch = 400;
+        auto dec = MetalLlamaDecoder::create(qt.ref.cfg, qt.w);
+        EXPECT(dec.is_ok() && exact_long);
+        if (!dec.is_ok()) continue;
+        MetalLlamaDecoder & d = *dec.value();
+        for (int len : {120, 330}) {
+            std::vector<int32_t> prompt;
+            for (int i = 0; i < len; i++) prompt.push_back((i * 13 + 5) % qt.ref.cfg.n_vocab);
+            Reference ref(qt.ref);
+            std::vector<double> want;
+            for (int32_t t : prompt) want = ref.step(ref.embedding(t));
+            d.reset();
+            EXPECT(d.eval_tokens(prompt).is_ok());
+            const double err = rel_l2(d.logits().value(), want);
+            EXPECT(err < 3e-3);
+            EXPECT_EQ(d.pending_token().value(), argmax(want));
+            const int32_t next = argmax(want);
+            want = ref.step(ref.embedding(next));
+            EXPECT(d.eval_tokens({next}).is_ok());
+            const double step_err = rel_l2(d.logits().value(), want);
+            EXPECT(step_err < 3e-3);
+            std::printf("        %-16s %d-token prompt in one call: logits relative L2 %.2e, next step %.2e\n", plan.name, len, err, step_err);
+        }
+    }
     // A row that is not a whole number of blocks, and gate/up of different types, are refused.
     bool exact = true;
     QuantTiny qt = make_quant(QuantPlan{"x", Q40, Q40, Q40, Q40, Q40, Q40, Q40, Q40, Q40}, 12, &exact);

@@ -327,25 +327,38 @@ kernel void rms_scale(device const float * x [[buffer(0)]], device float * scale
 }
 
 // The weight tile: each thread copies 16 consecutive values of one row into 8x8 blocks stored k-major (block (k-block, row-block), element [k][row]).
-static void big_stage_w(device const half * W, constant GemmParams & p, uint n0, uint k0, threadgroup half * sa, ushort tid) {
+// Split into the device load (issued before the barrier that waits for the previous step's products, so the loads overlap it, as llama.cpp's kernel
+// does) and the threadgroup store.
+static void big_load_w(device const half * W, constant GemmParams & p, uint n0, uint k0, ushort tid, thread half4 (&v)[4]) {
     const ushort row = tid / 2, half_k = tid % 2;
     const uint n = min(n0 + row, p.N - 1);   // rows past the end repeat the last one; their outputs are never stored
     device const half4 * src = (device const half4 *)(W + (ulong)n * p.K + k0 + 16 * half_k);
     _Pragma("clang loop unroll(full)")
+    for (ushort q = 0; q < 4; q++) v[q] = src[q];
+}
+
+static void big_put_w(thread const half4 (&v)[4], threadgroup half * sa, ushort tid) {
+    const ushort row = tid / 2, half_k = tid % 2;
+    _Pragma("clang loop unroll(full)")
     for (ushort q = 0; q < 4; q++) {
-        const half4 v = src[q];
         _Pragma("clang loop unroll(full)")
         for (ushort c = 0; c < 4; c++) {
             const ushort i = 4 * q + c;                          // 0..15 within this thread's slice
             const ushort kb = 2 * half_k + i / 8, rb = row / 8;  // k block 0..3, row block 0..7
-            sa[64 * (8 * kb + rb) + 8 * (i % 8) + row % 8] = v[c];
+            sa[64 * (8 * kb + rb) + 8 * (i % 8) + row % 8] = v[q][c];
         }
     }
 }
 
+static void big_stage_w(device const half * W, constant GemmParams & p, uint n0, uint k0, threadgroup half * sa, ushort tid) {
+    half4 v[4];
+    big_load_w(W, p, n0, k0, tid, v);
+    big_put_w(v, sa, tid);
+}
+
 // The activation tile: each thread converts 8 consecutive values of one token (normalized when asked) into blocks (k-block, token-block), element [token][k].
-static void big_stage_x(device const float * X, device const float * gamma, device const float * scale, constant GemmParams & p, uint m0, uint k0, bool norm,
-                        threadgroup half * sb, ushort tid) {
+static void big_load_x(device const float * X, device const float * gamma, device const float * scale, constant GemmParams & p, uint m0, uint k0, bool norm,
+                       ushort tid, thread half4 (&v)[2]) {
     const ushort tok = tid / 4, kb = tid % 4;
     const uint m = min(m0 + tok, p.M - 1);
     device const float4 * src = (device const float4 *)(X + (ulong)m * p.x_stride + k0 + 8 * kb);
@@ -356,9 +369,22 @@ static void big_stage_x(device const float * X, device const float * gamma, devi
         lo *= g[0] * s;
         hi *= g[1] * s;
     }
+    v[0] = half4(lo);
+    v[1] = half4(hi);
+}
+
+static void big_put_x(thread const half4 (&v)[2], threadgroup half * sb, ushort tid) {
+    const ushort tok = tid / 4, kb = tid % 4;
     threadgroup half4 * dst = (threadgroup half4 *)(sb + 64 * (4 * kb + tok / 8) + 8 * (tok % 8));
-    dst[0] = half4(lo);
-    dst[1] = half4(hi);
+    dst[0] = v[0];
+    dst[1] = v[1];
+}
+
+static void big_stage_x(device const float * X, device const float * gamma, device const float * scale, constant GemmParams & p, uint m0, uint k0, bool norm,
+                        threadgroup half * sb, ushort tid) {
+    half4 v[2];
+    big_load_x(X, gamma, scale, p, m0, k0, norm, tid, v);
+    big_put_x(v, sb, tid);
 }
 
 static void big_mma(threadgroup const half * sa, threadgroup const half * sb, ushort sg, thread simdgroup_float8x8 (&mc)[8]) {
@@ -401,9 +427,12 @@ kernel void matmul_big(device const half * W [[buffer(0)]], device const float *
     simdgroup_float8x8 mc[8];
     for (ushort i = 0; i < 8; i++) mc[i] = simdgroup_float8x8(0.f);
     for (uint k0 = 0; k0 < p.K; k0 += kBigK) {
+        half4 wv[4], xv[2];
+        big_load_w(W, p, n0, k0, tid, wv);
+        big_load_x(X, gamma, scale, p, m0, k0, norm, tid, xv);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        big_stage_w(W, p, n0, k0, sa, tid);
-        big_stage_x(X, gamma, scale, p, m0, k0, norm, sb, tid);
+        big_put_w(wv, sa, tid);
+        big_put_x(xv, sb, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         big_mma(sa, sb, sg, mc);
     }
@@ -424,7 +453,9 @@ kernel void matmul_gate_up_big(device const half * Wg [[buffer(0)]], device cons
                                device float * H [[buffer(3)]], device const float * gamma [[buffer(4)]], constant GemmParams & p [[buffer(5)]],
                                device const float * scale [[buffer(6)]], uint2 g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
                                ushort sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float buf[2 * kBigRows * kBigTokens];   // 16 KB: gate and up weight tiles + activations (10 KB) during the loop, both output tiles after it
+    // 10 KB: gate and up weight tiles + activations during the loop; after it, one 8 KB output tile at a time (gate, then up), so more threadgroups fit
+    // on a core than with both output tiles (16 KB).
+    threadgroup float buf[(2 * kBigRows * kBigK + kBigTokens * kBigK) / 2];
     threadgroup half * sg_w = (threadgroup half *)buf;
     threadgroup half * su_w = sg_w + kBigRows * kBigK;
     threadgroup half * sb = su_w + kBigRows * kBigK;
@@ -432,23 +463,31 @@ kernel void matmul_gate_up_big(device const half * Wg [[buffer(0)]], device cons
     simdgroup_float8x8 cg[8], cu[8];
     for (ushort i = 0; i < 8; i++) { cg[i] = simdgroup_float8x8(0.f); cu[i] = simdgroup_float8x8(0.f); }
     for (uint k0 = 0; k0 < p.K; k0 += kBigK) {
+        half4 gv[4], uv[4], xv[2];
+        big_load_w(Wg, p, n0, k0, tid, gv);
+        big_load_w(Wu, p, n0, k0, tid, uv);
+        big_load_x(X, gamma, scale, p, m0, k0, true, tid, xv);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        big_stage_w(Wg, p, n0, k0, sg_w, tid);
-        big_stage_w(Wu, p, n0, k0, su_w, tid);
-        big_stage_x(X, gamma, scale, p, m0, k0, true, sb, tid);
+        big_put_w(gv, sg_w, tid);
+        big_put_w(uv, su_w, tid);
+        big_put_x(xv, sb, tid);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         big_mma(sg_w, sb, sg, cg);
         big_mma(su_w, sb, sg, cu);
     }
+    // SiLU(gate) of this thread's 16 outputs kept in registers, then the up tile in the same threadgroup memory
+    constexpr uint kPer = kBigRows * kBigTokens / kGroupThreads;
+    float act[kPer];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     big_store_tile(cg, buf, sg);
-    big_store_tile(cu, buf + kBigRows * kBigTokens, sg);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint idx = tid; idx < kBigRows * kBigTokens; idx += kGroupThreads) {
-        const uint t = idx / kBigRows, r = idx % kBigRows, m = m0 + t, n = n0 + r;
-        if (m >= p.M || n >= p.N) continue;
-        const float a = buf[idx];
-        H[(ulong)m * p.y_stride + n] = a / (1.f + exp(-a)) * buf[kBigRows * kBigTokens + idx];
+    for (uint j = 0; j < kPer; j++) { const float a = buf[tid + j * kGroupThreads]; act[j] = a / (1.f + exp(-a)); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    big_store_tile(cu, buf, sg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = 0; j < kPer; j++) {
+        const uint idx = tid + j * kGroupThreads, t = idx / kBigRows, r = idx % kBigRows, m = m0 + t, n = n0 + r;
+        if (m < p.M && n < p.N) H[(ulong)m * p.y_stride + n] = act[j] * buf[idx];
     }
 }
 
@@ -604,8 +643,10 @@ kernel void attention_prefill(device const float * qkv [[buffer(0)]], device con
                               uint2 g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
                               ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
     constexpr uint DB = HD / 8;                       // 8-wide blocks along the head
-    threadgroup half Qs[kFlashQ * HD];
-    threadgroup half KV[2 * kFlashK * HD];            // keys then values; reused as the output staging area at the end
+    // keys then values; first the query tile (loaded into registers once), and the output staging area at the end. Without a separate query buffer
+    // two threadgroups fit on a core.
+    threadgroup half KV[2 * kFlashK * HD];
+    threadgroup half * Qs = KV;
     threadgroup half * Ks = KV;
     threadgroup half * Vs = KV + kFlashK * HD;
     threadgroup float S[4][8 * kFlashK];
@@ -614,10 +655,13 @@ kernel void attention_prefill(device const float * qkv [[buffer(0)]], device con
     const uint h = g.x, t0 = g.y * kFlashQ;           // first query of the tile (index within the chunk)
     const uint kvh = h / (p.n_head / p.n_head_kv);
     const uint last_key = p.p0 + min(t0 + kFlashQ, M) - 1;   // the tile's last query attends up to here
-    for (uint i = tid; i < kFlashQ * HD; i += kGroupThreads) {
-        const uint t = t0 + i / HD, d = i % HD;
-        Qs[i] = t < M ? half(qkv[t * p.qkv_stride + h * HD + d]) : half(0.f);
+    for (uint i = tid; i < kFlashQ * HD / 4; i += kGroupThreads) {
+        const uint t = t0 + (4 * i) / HD, d = (4 * i) % HD;
+        ((threadgroup half4 *)Qs)[i] = t < M ? half4(*(device const float4 *)(qkv + t * p.qkv_stride + h * HD + d)) : half4(0.f);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_half8x8 qm[DB];   // this simdgroup's 8 queries, for every key block
+    for (uint d = 0; d < DB; d++) simdgroup_load(qm[d], Qs + (8 * sg) * HD + 8 * d, HD);
     simdgroup_float8x8 O[DB];
     for (uint d = 0; d < DB; d++) O[d] = simdgroup_float8x8(0.f);
     // Row statistics of this lane's row (lanes 4r..4r+3 share row r).
@@ -625,22 +669,30 @@ kernel void attention_prefill(device const float * qkv [[buffer(0)]], device con
     const uint qpos = p.p0 + t0 + 8 * sg + r;          // absolute position of the row's query
     float m_run = -INFINITY, l_run = 0.f;
     for (uint k0 = 0; k0 <= last_key; k0 += kFlashK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = tid; i < kFlashK * HD; i += kGroupThreads) {
-            const uint j = k0 + i / HD, d = i % HD;
+        // the block's keys and values, 4 halfs per load, fetched before the barrier (the previous block's products may still read the tile)
+        constexpr uint KV4 = kFlashK * HD / 4 / kGroupThreads;
+        half4 kr[KV4], vr[KV4];
+        for (uint q = 0; q < KV4; q++) {
+            const uint i = tid + q * kGroupThreads, j = k0 + (4 * i) / HD, d = (4 * i) % HD;
             const bool ok = j <= last_key;
-            Ks[i] = ok ? kc[(ulong)j * p.kv_stride + kvh * HD + d] : half(0.f);
-            Vs[i] = ok ? vc[(ulong)j * p.kv_stride + kvh * HD + d] : half(0.f);
+            const ulong o = (ulong)j * p.kv_stride + kvh * HD + d;
+            kr[q] = ok ? *(device const half4 *)(kc + o) : half4(0.h);
+            vr[q] = ok ? *(device const half4 *)(vc + o) : half4(0.h);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint q = 0; q < KV4; q++) {
+            const uint i = tid + q * kGroupThreads;
+            ((threadgroup half4 *)Ks)[i] = kr[q];
+            ((threadgroup half4 *)Vs)[i] = vr[q];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // S = Q_sg (8 x HD) . K^T (HD x 32)
         for (uint kb = 0; kb < kFlashK / 8; kb++) {
             simdgroup_float8x8 acc(0.f);
             for (uint d = 0; d < DB; d++) {
-                simdgroup_half8x8 qa, kb_t;
-                simdgroup_load(qa, Qs + (8 * sg) * HD + 8 * d, HD);
+                simdgroup_half8x8 kb_t;
                 simdgroup_load(kb_t, Ks + (8 * kb) * HD + 8 * d, HD, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(acc, qa, kb_t, acc);
+                simdgroup_multiply_accumulate(acc, qm[d], kb_t, acc);
             }
             simdgroup_store(acc, &S[sg][8 * kb], kFlashK);
         }
@@ -922,7 +974,7 @@ kernel void argmax(device const float * logits [[buffer(0)]], device int * token
     }
 }
 )MSL") + R"MSL(
-// ---- Quantized weights: ggml's block formats, read in place (one token: dot products per 32-element chunk; prefill: dequantized to half first) ----
+// ---- Quantized weights: ggml's block formats, read in place (one token: dot products per 8-element group; prefill: the tiles unpacked as they are staged) ----
 // Layouts (ggml-common.h): q4_0 {half d; uchar qs[16]} 18 B / 32; q5_0 {half d; uchar qh[4]; uchar qs[16]} 22 B / 32; q8_0 {half d; char qs[32]} 34 B / 32;
 // q4_K {half d, dmin; uchar scales[12]; uchar qs[128]} 144 B / 256; q6_K {uchar ql[128]; uchar qh[64]; char scales[16]; half d} 210 B / 256.
 // Blocks are only 2-byte aligned (rows follow each other unpadded), so the reads are bytes and halves. The values equal ggml's dequantize_row_* exactly.
@@ -951,11 +1003,11 @@ static float hsum(float4 v) { return v.x + v.y + v.z + v.w; }
 // Four bytes of a word as floats (the unpacking is done on whole words: nibbles with 0x0F0F0F0F masks, then one conversion).
 static float4 bytes4(uint u) { return float4(as_type<uchar4>(u)); }
 
-// Bit i of a 4-bit value moved to bit 4 of byte i: q5_0's fifth bits for four elements at once.
-constant uint kQ5High[16] = {0x00000000u, 0x00000010u, 0x00001000u, 0x00001010u, 0x00100000u, 0x00100010u, 0x00101000u, 0x00101010u,
-                             0x10000000u, 0x10000010u, 0x10001000u, 0x10001010u, 0x10100000u, 0x10100010u, 0x10101000u, 0x10101010u};
+// Bit i of a 4-bit value moved to bit 4 of byte i: q5_0's fifth bits for four elements at once (shifts and a mask: a table indexed differently per lane
+// serializes on the constant cache).
+static uint spread4(uint n) { return ((n | (n << 7) | (n << 14) | (n << 21)) & 0x01010101u) << 4; }
 
-// Per format: elem (embedding lookup, dequantization for the prefill), load (group g's input values and sums) and dot (one row's group g).
+// Per format: elem (embedding lookup), row16 (the prefill matmuls' weight tiles), load (group g's input values and sums) and dot (one row's group g).
 // q4_0 / q5_0: group g = block g/4, bytes 4q..4q+3 (q = g%4) of qs: low nibbles are elements 4q.. (a), high nibbles 16+4q.. (b).
 struct Q4_0 {
     enum { BLK = 32, BYTES = 18 };
@@ -971,6 +1023,16 @@ struct Q4_0 {
         xg.s.x = hsum(xg.a) + hsum(xg.b);
     }
     static uint qword(device const uchar * p) { device const ushort * q = (device const ushort *)p; return uint(q[0]) | (uint(q[1]) << 16); }
+    // The 16 weights of the row at columns c..c+15 (c a multiple of 16) as half, for the prefill matmuls' tile loads (the values elem gives).
+    static void row16(device const uchar * row, uint c, thread half4 (&o)[4]) {
+        device const uchar * b = row + (c / 32) * 18;
+        const float d = ld_half(b);
+        const bool hi = (c % 32) >= 16;
+        for (uint i = 0; i < 4; i++) {
+            const uint u = qword(b + 2 + 4 * i);
+            o[i] = half4(d * (bytes4(hi ? (u >> 4) & 0x0F0F0F0Fu : u & 0x0F0F0F0Fu) - 8.f));
+        }
+    }
     static float dot(device const uchar * row, uint g, thread const XGroup & x) {
         device const uchar * b = row + (g / 4) * 18;
         const uint u = qword(b + 2 + (g % 4) * 4);
@@ -989,10 +1051,21 @@ struct Q5_0 {
     static void load(threadgroup const float4 * xs4, device const float * x, device const float * gamma, bool norm, uint g, thread XGroup & xg) {
         Q4_0::load(xs4, x, gamma, norm, g, xg);   // the same element layout
     }
+    static void row16(device const uchar * row, uint c, thread half4 (&o)[4]) {
+        device const uchar * b = row + (c / 32) * 22;
+        const float d = ld_half(b);
+        const uint qh = high_bits(b);
+        const bool hi = (c % 32) >= 16;
+        for (uint i = 0; i < 4; i++) {
+            const uint u = Q4_0::qword(b + 6 + 4 * i), j0 = 4 * i;
+            const uint w = hi ? ((u >> 4) & 0x0F0F0F0Fu) | spread4((qh >> (j0 + 16)) & 15u) : (u & 0x0F0F0F0Fu) | spread4((qh >> j0) & 15u);
+            o[i] = half4(d * (bytes4(w) - 16.f));
+        }
+    }
     static float dot(device const uchar * row, uint g, thread const XGroup & x) {
         device const uchar * b = row + (g / 4) * 22;
         const uint j0 = (g % 4) * 4, qh = high_bits(b), u = Q4_0::qword(b + 6 + j0);
-        const uint lo = (u & 0x0F0F0F0Fu) | kQ5High[(qh >> j0) & 15u], hi = ((u >> 4) & 0x0F0F0F0Fu) | kQ5High[(qh >> (j0 + 16)) & 15u];
+        const uint lo = (u & 0x0F0F0F0Fu) | spread4((qh >> j0) & 15u), hi = ((u >> 4) & 0x0F0F0F0Fu) | spread4((qh >> (j0 + 16)) & 15u);
         return ld_half(b) * (metal::dot(bytes4(lo), x.a) + metal::dot(bytes4(hi), x.b) - 16.f * x.s.x);
     }
 };
@@ -1007,6 +1080,12 @@ struct Q8_0 {
     static void load(threadgroup const float4 * xs4, device const float * x, device const float * gamma, bool norm, uint g, thread XGroup & xg) {
         xg.a = xin4(xs4, x, gamma, norm, g * 8);
         xg.b = xin4(xs4, x, gamma, norm, g * 8 + 4);
+    }
+    static void row16(device const uchar * row, uint c, thread half4 (&o)[4]) {
+        device const uchar * b = row + (c / 32) * 34;
+        const float d = ld_half(b);
+        device const uchar * q = b + 2 + (c % 32);
+        for (uint i = 0; i < 4; i++) o[i] = half4(d * float4(as_type<char4>(Q4_0::qword(q + 4 * i))));
     }
     static float dot(device const uchar * row, uint g, thread const XGroup & x) {
         device const uchar * b = row + (g / 4) * 34;
@@ -1041,6 +1120,15 @@ struct Q4_K {
         xg.s.x = hsum(xg.a);
         xg.s.y = hsum(xg.b);
     }
+    static void row16(device const uchar * row, uint c, thread half4 (&o)[4]) {
+        device const uchar * b = row + (c / 256) * 144;
+        const uint j0 = c % 256, sub = j0 / 32, l0 = j0 % 32, shift = (sub & 1u) * 4;
+        float sc, m;
+        scale_min_k4(sub, b + 4, sc, m);
+        const float d = ld_half(b), dmin = ld_half(b + 2);
+        const uint4 w = *(device const uint4 *)(b + 16 + 32 * (sub / 2) + l0);   // 16-byte aligned (144-byte blocks)
+        for (uint i = 0; i < 4; i++) o[i] = half4(d * sc * bytes4((w[i] >> shift) & 0x0F0F0F0Fu) - dmin * m);
+    }
     static float dot(device const uchar * row, uint g, thread const XGroup & x) {
         device const uchar * b = row + (g / 32) * 144;
         const uint t = g % 32, p = t / 8;
@@ -1071,6 +1159,18 @@ struct Q6_K {
         xg.a = float4(v0, v1);
         xg.b = float4(v2, v3);
         xg.s = float4(v0.x + v0.y, v1.x + v1.y, v2.x + v2.y, v3.x + v3.y);
+    }
+    static void row16(device const uchar * row, uint c, thread half4 (&o)[4]) {
+        device const uchar * b = row + (c / 256) * 210;
+        const uint j0 = c % 256, h = j0 / 128, k = (j0 % 128) / 32, l0 = j0 % 32;
+        device const uchar * ql = b + 64 * h + (k & 1u) * 32 + l0;
+        device const uchar * qh = b + 128 + 32 * h + l0;
+        const float d = ld_half(b + 208), sc = float(((device const char *)(b + 192))[8 * h + l0 / 16 + 2 * k]);
+        for (uint i = 0; i < 4; i++) {
+            const uint lo = Q4_0::qword(ql + 4 * i), hb = Q4_0::qword(qh + 4 * i);
+            const uint w = ((k < 2 ? lo : lo >> 4) & 0x0F0F0F0Fu) | (((hb >> (2 * k)) & 0x03030303u) << 4);
+            o[i] = half4(d * sc * (bytes4(w) - 32.f));
+        }
     }
     static float dot(device const uchar * row, uint g, thread const XGroup & x) {
         device const uchar * b = row + (g / 32) * 210;
@@ -1195,9 +1295,182 @@ kernel void embedq(device const uchar * table [[buffer(0)]], device const int * 
     x[(ulong)row * p.n_embd + i] = Q::elem(table + (ulong)tokens[p.token_index + row] * RB, i);
 }
 
+
+
+// ---- Prefill matmuls on quantized weights: the same kernels as matmul_16x16 / matmul_big, the weight tiles unpacked from the blocks as they are staged
+// (row16: 16 weights per thread and step, the values elem gives, rounded to half as the f16 path's operands) instead of a dequantized copy first.
+
+template <typename Q>
+static void big_stage_wq(device const uchar * W, constant GemmParams & p, uint n0, uint k0, threadgroup half * sa, ushort tid) {
+    const ushort row = tid / 2, half_k = tid % 2;
+    const uint n = min(n0 + row, p.N - 1);   // rows past the end repeat the last one; their outputs are never stored
+    half4 v[4];
+    Q::row16(W + (ulong)n * (ulong(p.K / Q::BLK) * Q::BYTES), k0 + 16 * half_k, v);
+    _Pragma("clang loop unroll(full)")
+    for (ushort q = 0; q < 4; q++) {
+        _Pragma("clang loop unroll(full)")
+        for (ushort c = 0; c < 4; c++) {
+            const ushort i = 4 * q + c;
+            const ushort kb = 2 * half_k + i / 8, rb = row / 8;
+            sa[64 * (8 * kb + rb) + 8 * (i % 8) + row % 8] = v[q][c];
+        }
+    }
+}
+
+template <typename Q>
+kernel void matmul_bigq(device const uchar * W [[buffer(0)]], device const float * X [[buffer(1)]], device float * Y [[buffer(2)]],
+                        device const float * gamma [[buffer(3)]], constant GemmParams & p [[buffer(4)]], device const float * bias [[buffer(5)]],
+                        device const float * scale [[buffer(6)]], uint2 g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float buf[kBigRows * kBigTokens];
+    threadgroup half * sa = (threadgroup half *)buf;
+    threadgroup half * sb = sa + kBigRows * kBigK;
+    const uint n0 = g.y * kBigRows, m0 = g.x * kBigTokens;
+    const bool norm = (p.flags & 1u) != 0;
+    simdgroup_float8x8 mc[8];
+    for (ushort i = 0; i < 8; i++) mc[i] = simdgroup_float8x8(0.f);
+    for (uint k0 = 0; k0 < p.K; k0 += kBigK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        big_stage_wq<Q>(W, p, n0, k0, sa, tid);
+        big_stage_x(X, gamma, scale, p, m0, k0, norm, sb, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        big_mma(sa, sb, sg, mc);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    big_store_tile(mc, buf, sg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = tid; idx < kBigRows * kBigTokens; idx += kGroupThreads) {
+        const uint t = idx / kBigRows, r = idx % kBigRows, m = m0 + t, n = n0 + r;
+        if (m >= p.M || n >= p.N) continue;
+        const ulong o = (ulong)m * p.y_stride + n;
+        const float v = buf[idx] + ((p.flags & 4u) ? bias[n] : 0.f);
+        Y[o] = (p.flags & 2u) ? Y[o] + v : v;
+    }
+}
+
+template <typename Q>
+kernel void matmul_gate_up_bigq(device const uchar * Wg [[buffer(0)]], device const uchar * Wu [[buffer(1)]], device const float * X [[buffer(2)]],
+                                device float * H [[buffer(3)]], device const float * gamma [[buffer(4)]], constant GemmParams & p [[buffer(5)]],
+                                device const float * scale [[buffer(6)]], uint2 g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                                ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float buf[2 * kBigRows * kBigTokens];
+    threadgroup half * sg_w = (threadgroup half *)buf;
+    threadgroup half * su_w = sg_w + kBigRows * kBigK;
+    threadgroup half * sb = su_w + kBigRows * kBigK;
+    const uint n0 = g.y * kBigRows, m0 = g.x * kBigTokens;
+    simdgroup_float8x8 cg[8], cu[8];
+    for (ushort i = 0; i < 8; i++) { cg[i] = simdgroup_float8x8(0.f); cu[i] = simdgroup_float8x8(0.f); }
+    for (uint k0 = 0; k0 < p.K; k0 += kBigK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        big_stage_wq<Q>(Wg, p, n0, k0, sg_w, tid);
+        big_stage_wq<Q>(Wu, p, n0, k0, su_w, tid);
+        big_stage_x(X, gamma, scale, p, m0, k0, true, sb, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        big_mma(sg_w, sb, sg, cg);
+        big_mma(su_w, sb, sg, cu);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    big_store_tile(cg, buf, sg);
+    big_store_tile(cu, buf + kBigRows * kBigTokens, sg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = tid; idx < kBigRows * kBigTokens; idx += kGroupThreads) {
+        const uint t = idx / kBigRows, r = idx % kBigRows, m = m0 + t, n = n0 + r;
+        if (m >= p.M || n >= p.N) continue;
+        const float a = buf[idx];
+        H[(ulong)m * p.y_stride + n] = a / (1.f + exp(-a)) * buf[kBigRows * kBigTokens + idx];
+    }
+}
+
+// The small kernels' B tile (TN rows x kTileK) from quantized rows: one thread per 16 weights.
+template <uint TN, typename Q>
+static void stage_bq(device const uchar * W, constant GemmParams & p, uint n0, uint k0, threadgroup half4 * Bs4, uint tid) {
+    constexpr uint K16 = kTileK / 16, K4 = kTileK / 4;
+    const ulong RB = ulong(p.K / Q::BLK) * Q::BYTES;
+    for (uint idx = tid; idx < TN * K16; idx += kGroupThreads) {
+        const uint r = idx / K16, kq = idx % K16, n = n0 + r;
+        half4 v[4] = {half4(0.h), half4(0.h), half4(0.h), half4(0.h)};
+        if (n < p.N) Q::row16(W + (ulong)n * RB, k0 + 16 * kq, v);
+        for (uint i = 0; i < 4; i++) Bs4[r * K4 + 4 * kq + i] = v[i];
+    }
+}
+
+template <uint TM, uint TN, typename Q>
+kernel void matmulq(device const uchar * W [[buffer(0)]], device const float * X [[buffer(1)]], device float * Y [[buffer(2)]],
+                    device const float * gamma [[buffer(3)]], constant GemmParams & p [[buffer(4)]], device const float * bias [[buffer(5)]],
+                    uint2 g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint BM = TM / 16, BN = TN / 16;
+    threadgroup half4 As4[TM * kTileK / 4];
+    threadgroup half4 Bs4[TN * kTileK / 4];
+    threadgroup float Cs[TM * TN];
+    threadgroup float scale[TM];
+    const uint n0 = g.x * TN, m0 = g.y * TM;
+    const uint sm = (sg / 2) * (TM / 2), sn = (sg % 2) * (TN / 2);
+    const bool norm = (p.flags & 1u) != 0;
+    tile_scales<TM>(X, p, m0, norm, scale, lane, sg);
+    simdgroup_float8x8 c[BM][BN];
+    for (uint i = 0; i < BM; i++) for (uint j = 0; j < BN; j++) c[i][j] = simdgroup_float8x8(0.f);
+    for (uint k0 = 0; k0 < p.K; k0 += kTileK) {
+        stage_a<TM>(X, gamma, p, m0, k0, norm, scale, As4, tid);
+        stage_bq<TN, Q>(W, p, n0, k0, Bs4, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tile_mma<BM, BN>((threadgroup const half *)As4, (threadgroup const half *)Bs4, sm, sn, c);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < BM; i++) for (uint j = 0; j < BN; j++) simdgroup_store(c[i][j], Cs + (sm + i * 8) * TN + sn + j * 8, TN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = tid; idx < TM * TN; idx += kGroupThreads) {
+        const uint r = idx / TN, col = idx % TN, m = m0 + r, n = n0 + col;
+        if (m >= p.M || n >= p.N) continue;
+        const ulong o = (ulong)m * p.y_stride + n;
+        const float v = Cs[idx] + ((p.flags & 4u) ? bias[n] : 0.f);
+        Y[o] = (p.flags & 2u) ? Y[o] + v : v;
+    }
+}
+
+template <uint TM, uint TN, typename Q>
+kernel void matmul_gate_upq(device const uchar * Wg [[buffer(0)]], device const uchar * Wu [[buffer(1)]], device const float * X [[buffer(2)]],
+                            device float * H [[buffer(3)]], device const float * gamma [[buffer(4)]], constant GemmParams & p [[buffer(5)]],
+                            uint2 g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint BM = TM / 16, BN = TN / 16;
+    threadgroup half4 As4[TM * kTileK / 4];
+    threadgroup half4 Bg4[TN * kTileK / 4];
+    threadgroup half4 Bu4[TN * kTileK / 4];
+    threadgroup float Cg[TM * TN];
+    threadgroup float Cu[TM * TN];
+    threadgroup float scale[TM];
+    const uint n0 = g.x * TN, m0 = g.y * TM;
+    const uint sm = (sg / 2) * (TM / 2), sn = (sg % 2) * (TN / 2);
+    tile_scales<TM>(X, p, m0, true, scale, lane, sg);
+    simdgroup_float8x8 cg[BM][BN], cu[BM][BN];
+    for (uint i = 0; i < BM; i++) for (uint j = 0; j < BN; j++) { cg[i][j] = simdgroup_float8x8(0.f); cu[i][j] = simdgroup_float8x8(0.f); }
+    for (uint k0 = 0; k0 < p.K; k0 += kTileK) {
+        stage_a<TM>(X, gamma, p, m0, k0, true, scale, As4, tid);
+        stage_bq<TN, Q>(Wg, p, n0, k0, Bg4, tid);
+        stage_bq<TN, Q>(Wu, p, n0, k0, Bu4, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tile_mma<BM, BN>((threadgroup const half *)As4, (threadgroup const half *)Bg4, sm, sn, cg);
+        tile_mma<BM, BN>((threadgroup const half *)As4, (threadgroup const half *)Bu4, sm, sn, cu);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < BM; i++) for (uint j = 0; j < BN; j++) {
+        simdgroup_store(cg[i][j], Cg + (sm + i * 8) * TN + sn + j * 8, TN);
+        simdgroup_store(cu[i][j], Cu + (sm + i * 8) * TN + sn + j * 8, TN);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx = tid; idx < TM * TN; idx += kGroupThreads) {
+        const uint r = idx / TN, col = idx % TN, m = m0 + r, n = n0 + col;
+        if (m >= p.M || n >= p.N) continue;
+        const float a = Cg[idx];
+        H[(ulong)m * p.y_stride + n] = a / (1.f + exp(-a)) * Cu[idx];
+    }
+}
+
 struct DequantParams { uint K; uint rows; };
 
-// out[r][k] = half(W[r][k]) for the prefill matmuls (rows x K elements, one thread each).
+// out[r][k] = half(W[r][k]) (rows x K elements, one thread each): long prompts dequantize each matrix once before the f16 matmul (cheaper than unpacking
+// the tiles again for every 32 tokens, see the host's kFusedMaxTokens).
 template <typename Q>
 kernel void dequant_half(device const uchar * W [[buffer(0)]], device half * out [[buffer(1)]], constant DequantParams & p [[buffer(2)]],
                          uint2 gp [[thread_position_in_grid]]) {
@@ -1213,7 +1486,15 @@ kernel void dequant_half(device const uchar * W [[buffer(0)]], device half * out
         device const float *, constant MatvecParams &, threadgroup float4 *, uint, uint, uint, uint); \
     template [[host_name("embed_" #Q)]] kernel void embedq<Q>(device const uchar *, device const int *, device float *, constant EmbedParams &, \
         device const float *, uint2); \
-    template [[host_name("dequant_" #Q)]] kernel void dequant_half<Q>(device const uchar *, device half *, constant DequantParams &, uint2);
+    template [[host_name("dequant_" #Q)]] kernel void dequant_half<Q>(device const uchar *, device half *, constant DequantParams &, uint2); \
+    template [[host_name("matmul_big_" #Q)]] kernel void matmul_bigq<Q>(device const uchar *, device const float *, device float *, device const float *, \
+        constant GemmParams &, device const float *, device const float *, uint2, ushort, ushort); \
+    template [[host_name("matmul_gate_up_big_" #Q)]] kernel void matmul_gate_up_bigq<Q>(device const uchar *, device const uchar *, device const float *, \
+        device float *, device const float *, constant GemmParams &, device const float *, uint2, ushort, ushort); \
+    template [[host_name("matmul_16x16_" #Q)]] kernel void matmulq<16, 16, Q>(device const uchar *, device const float *, device float *, \
+        device const float *, constant GemmParams &, device const float *, uint2, uint, uint, uint); \
+    template [[host_name("matmul_gate_up_16x16_" #Q)]] kernel void matmul_gate_upq<16, 16, Q>(device const uchar *, device const uchar *, \
+        device const float *, device float *, device const float *, constant GemmParams &, uint2, uint, uint, uint);
 DOOMS_QUANT_KERNELS(Q4_0)
 DOOMS_QUANT_KERNELS(Q5_0)
 DOOMS_QUANT_KERNELS(Q8_0)

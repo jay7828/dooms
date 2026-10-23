@@ -376,3 +376,4 @@ div.proj { cursor: default; }
 .claim-code { max-width: 760px; }
 .claim-code pre { overflow-x: auto; }
 @media (max-width: 560px) { .claim { padding-left: 16px; padding-right: 16px; } .claim-row { grid-template-columns: 1fr; gap: 12px; } }
+.claim-kicker { color: var(--ink-2); margin: 10px 0 0; font-size: 15px; }

@@ -63,6 +63,7 @@
     <!-- the 4-bit result, with the command that reproduces it -->
     <section class="claim wrap" id="claim">
       <h2 class="rise-in">256 tokens per second at 4-bit. MLX-LM: 224.</h2>
+      <p class="claim-kicker">Writing the answer (decode). Reading the prompt: ahead of MLX-LM, 7% behind llama.cpp.</p>
       <p class="section-body">Qwen2.5-0.5B, a 512-token prompt, 128 tokens after it, on an M1 Pro. The engine's own Metal decoder on a pure Q4_0 file (271 MB) against
         MLX-LM's published 4-bit model of the same size (mlx-community, 265 MB), and llama.cpp on the same file (239). It picks llama.cpp's greedy tokens on every prompt tested. Rerun it on your
         Mac and send the numbers.</p>
@@ -125,12 +126,12 @@ scripts/reproduce-4bit.sh   <span class="c"># builds, downloads pinned models, p
       <h2 class="rise-in">Where it loses</h2>
       <div class="loss-grid">
         <div class="loss rise-in">
-          <div class="loss-num"><span data-count="4604">4604</span> vs <span data-count="3999">3999</span></div>
-          <p>tokens per second on a 512-token prompt, llama.cpp against the engine's own decoder (Qwen2.5-0.5B, f16). Decode is ahead; the prompt is not yet.</p>
+          <div class="loss-num"><span data-count="4525">4525</span> vs <span data-count="4263">4263</span></div>
+          <p>tokens per second reading a 512-token prompt, llama.cpp against the engine's own decoder (Qwen2.5-0.5B, f16). Writing the answer is ahead; reading the prompt is not yet.</p>
         </div>
         <div class="loss rise-in">
-          <div class="loss-num"><span data-count="4266">4266</span> vs <span data-count="3745">3745</span></div>
-          <p>tokens per second on a 512-token prompt at 4-bit (Q4_0), llama.cpp against the engine (MLX-LM: 3838), which turns the 4-bit weights back to 16-bit before each prompt matmul.</p>
+          <div class="loss-num"><span data-count="4256">4256</span> vs <span data-count="3975">3975</span></div>
+          <p>tokens per second reading a 512-token prompt at 4-bit (Q4_0), llama.cpp against the engine. Ahead of MLX-LM (3814) at every prompt length measured; llama.cpp's matmul kernel is still faster.</p>
         </div>
         <div class="loss rise-in">
           <div class="loss-num"><span data-count="15" data-suffix="x">15x</span></div>

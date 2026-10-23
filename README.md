@@ -17,11 +17,11 @@ Apple Silicon macOS only. The engine is an inference engine, not a trainer.
 
 ## 256 tokens/s at 4-bit, against MLX-LM's 224
 
-| Qwen2.5-0.5B-Instruct, 512-token prompt, 128 tokens, M1 Pro | decode tokens/s | prompt tokens/s |
+| Qwen2.5-0.5B-Instruct, 512-token prompt, 128 tokens, M1 Pro | writing the answer (decode), tokens/s | reading the prompt, tokens/s |
 |---|--:|--:|
-| **dooms.cpp, own Metal decoder, Q4_0** (271 MB) | **256.1** | 3745 |
-| llama.cpp, same file | 238.7 | **4266** |
-| MLX-LM 4-bit, mlx-community (265 MB) | 224.3 | 3838 |
+| **dooms.cpp, own Metal decoder, Q4_0** (271 MB) | **256.1** | 3975 |
+| llama.cpp, same file | 238.7 | **4256** |
+| MLX-LM 4-bit, mlx-community (265 MB) | 224.3 | 3814 |
 
 The engine picks llama.cpp's greedy tokens on every prompt tested, from the same file. Rerun it on your Mac (builds, downloads pinned models, prints this
 table and the token check; about 2 GB):
@@ -32,8 +32,8 @@ scripts/reproduce-4bit.sh
 ```
 
 Please share your numbers (chip, memory, macOS) in an issue: every figure here comes from one M1 Pro. Q4_0 is the GGUF of MLX-LM's 4-bit size, not of its
-accuracy: MLX's affine 4-bit blocks keep more per bit. At 4-bit the prompt is behind llama.cpp (12%) and MLX-LM (2%); llama.cpp's Q4_K_M mix runs at
-209.2 tokens/s on the engine (llama.cpp: 165.3), below MLX-LM's 4-bit model.
+accuracy: MLX's affine 4-bit blocks keep more per bit. Reading the prompt, the engine is ahead of MLX-LM at every length measured (17, 82 and 512 tokens)
+and behind llama.cpp (7% at 512 tokens); llama.cpp's Q4_K_M mix runs at 209.2 tokens/s on the engine (llama.cpp: 165.3), below MLX-LM's 4-bit model.
 
 ## Benchmarks
 
@@ -45,18 +45,18 @@ same precision everywhere (f16 unless stated). Full tables, methods and history:
 
 | | decode, tokens/s | prompt, tokens/s |
 |---|--:|--:|
-| **dooms.cpp f16** | **137.9** | 3999 |
+| **dooms.cpp f16** | **137.9** | 4263 |
 | MLX-LM fp16 | 136.2 | 3864 |
 | llama.cpp f16 | 130.7 | **4604** |
 | PyTorch MPS fp16 | 37.6 | 2492 |
 
-Fastest f16 decode; the prompt is 13% behind llama.cpp. 4-bit files run on the engine's own decoder too:
+Fastest f16 decode; the prompt is 6% behind llama.cpp (4263 vs 4525 tokens/s measured together, 2026-10-23). 4-bit files run on the engine's own decoder too:
 
 | 4-bit, 512-token prompt, 128 tokens | decode tokens/s | prompt tokens/s |
 |---|--:|--:|
-| **dooms.cpp Q4_0** (271 MB) | **256.1** | 3745 |
-| llama.cpp Q4_0 (same file) | 238.7 | **4266** |
-| MLX-LM 4-bit (mlx-community, 265 MB) | 224.3 | 3838 |
+| **dooms.cpp Q4_0** (271 MB) | **256.1** | 3975 |
+| llama.cpp Q4_0 (same file) | 238.7 | **4256** |
+| MLX-LM 4-bit (mlx-community, 265 MB) | 224.3 | 3814 |
 | **dooms.cpp Q4_K_M** (379 MB) | 209.2 | 3689 |
 | llama.cpp Q4_K_M (same file) | 165.3 | 3634 |
 

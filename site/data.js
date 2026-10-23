@@ -80,9 +80,10 @@ window.DOOMS = {
       { sys: "dooms", name: "dooms.cpp Q4_K_M, own decoder", tps: 209.2 },
       { sys: "llama", name: "llama.cpp Q4_K_M", tps: 165.3 },
     ],
+    // llama.cpp and dooms.cpp measured together on 2026-10-23 (after the prefill speed-ups); MLX-LM and PyTorch from the 2026-10-15 run
     prefill: [
-      { sys: "llama", name: "llama.cpp f16", tps: 4604 },
-      { sys: "dooms", name: "dooms.cpp f16, own Metal decoder", tps: 3999 },
+      { sys: "llama", name: "llama.cpp f16", tps: 4525 },
+      { sys: "dooms", name: "dooms.cpp f16, own Metal decoder", tps: 4263 },
       { sys: "mlx", name: "MLX-LM fp16", tps: 3864 },
       { sys: "pytorch", name: "PyTorch MPS fp16", tps: 2492 },
     ],

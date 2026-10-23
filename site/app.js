@@ -188,8 +188,8 @@
         { title: "decode at 4-bit (a different precision), tokens per second", rows: D.llm.decode4.map((t) => ({ sys: t.sys, name: t.name, value: t.tps })), unit: "tok/s", better: "higher" },
       ],
       note: () => `${D.llm.provisional ? '<span class="badge">single run, final interleaved run pending</span>' : ""}
-             <p><strong>Fastest f16 decode</strong>: the engine's own Metal decoder runs Qwen2 and llama files. The prompt is 13% behind llama.cpp, ahead of MLX and PyTorch.</p>
-             <p><strong>4-bit on the own decoder too</strong>: Q4_0 at MLX-LM's size decodes 1.14x MLX-LM and 1.07x llama.cpp (the prompt is 2% behind MLX-LM, 12% behind llama.cpp); Q4_K_M 1.27x llama.cpp on the same file, with llama.cpp's greedy tokens on every prompt tested. f16 answers match transformers token for token, 29 of 29.</p>`,
+             <p><strong>Fastest f16 decode</strong>: the engine's own Metal decoder runs Qwen2 and llama files. The prompt is 6% behind llama.cpp, ahead of MLX and PyTorch.</p>
+             <p><strong>4-bit on the own decoder too</strong>: Q4_0 at MLX-LM's size decodes 1.14x MLX-LM and 1.07x llama.cpp (reading the prompt: ahead of MLX-LM, 7% behind llama.cpp); Q4_K_M 1.27x llama.cpp on the same file, with llama.cpp's greedy tokens on every prompt tested. f16 answers match transformers token for token, 29 of 29.</p>`,
     },
     speech: {
       title: "Whisper speech to text",
